@@ -1,0 +1,15 @@
+# Example config.yaml with paper trading and minimum premium threshold settings
+fyers:
+  client_id: "YOUR_CLIENT_ID"
+  app_secret: "YOUR_APP_SECRET"
+  redirect_uri: "YOUR_REDIRECT_URI"
+  access_token: ""  # Will be generated and stored by the authentication process
+
+strategy:
+  paper_trading: true  # Set to false for live trading with real money
+  min_premium_threshold: 50.0  # Minimum premium value to consider for trade entry (if highest OI strike premium is below this, system will check 2nd highest and next expiry)
+  max_strike_distance: 500  # Maximum allowed distance from ATM price in Nifty points
+
+logging:
+  level: "INFO"
+  file: "logs/strategy.log"

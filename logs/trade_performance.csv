@@ -1,0 +1,2 @@
+date,time,symbol,option_type,strike_price,entry_price,exit_price,quantity,pnl,pnl_pct,exit_type,duration_min,is_paper
+2025-06-30,09:45:24,NSE:NIFTY2570325700CE,CE,0,114.95,91.7,75,-1743.75,-20.22618529795563,STOPLOSS,21.04594858333333,True
