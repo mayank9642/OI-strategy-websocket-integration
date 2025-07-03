@@ -1,9 +1,142 @@
+def robust_market_data_websocket(symbols, callback_handler=None, data_type="SymbolUpdate", on_success=None, on_failure=None):
+    """
+    Robust WebSocket connection with auto-reconnect, heartbeat, thread-safe queue, and throttling.
+    Returns the ws_client with .tick_queue for tick data.
+    """
+    import queue, threading, random, time
+    config = load_config()
+    client_id = config['fyers']['client_id']
+    access_token = ensure_valid_token()
+
+    tick_queue = queue.Queue()
+    throttle_interval = 1  # seconds
+    last_tick_time = [0]
+    min_delay = 1
+    max_delay = 60
+    backoff = min_delay
+    heartbeat_interval = 30
+    last_ping_time = [time.time()]
+
+    expected_columns = [
+        'ltp', 'vol_traded_today', 'last_traded_time', 'exch_feed_time',
+        'bid_size', 'ask_size', 'bid_price', 'ask_price', 
+        'last_traded_qty', 'tot_buy_qty', 'tot_sell_qty', 'avg_trade_price',
+        'low_price', 'high_price', 'open_price', 'prev_close_price', 'symbol'
+    ]
+    market_data_df = pd.DataFrame(columns=expected_columns)
+    market_data_df.set_index('symbol', inplace=True)
+    for symbol in symbols:
+        market_data_df.loc[symbol] = [None] * (len(expected_columns) - 1)
+
+    def on_message(ticks):
+        now = time.time()
+        if now - last_tick_time[0] < throttle_interval:
+            return
+        last_tick_time[0] = now
+        if ticks.get('symbol'):
+            symbol = ticks.get('symbol')
+            is_option = "CE" in symbol or "PE" in symbol
+            for key, value in ticks.items():
+                if key != 'symbol':
+                    try:
+                        market_data_df.loc[symbol, key] = value
+                    except Exception as e:
+                        logging.warning(f"Failed to update DataFrame for {symbol} - {key}: {e}")
+            tick_queue.put(ticks)
+            if callback_handler:
+                callback_handler(symbol, 'tick', ticks, ticks)
+            if 'ltp' in ticks:
+                if is_option:
+                    logging.info(f"WebSocket option tick: {symbol} LTP: {ticks['ltp']}")
+                else:
+                    logging.info(f"WebSocket tick: {symbol} LTP: {ticks['ltp']}")
+
+    def on_error(error):
+        logging.error(f"WebSocket error: {error}")
+
+    def on_close(message):
+        logging.info(f"WebSocket connection closed: {message}")
+
+    def on_subscribe_success(response):
+        logging.info(f"WebSocket subscription success: {response}")
+        if callable(on_success):
+            on_success(response)
+
+    def on_subscribe_failure(error_code, message):
+        logging.error(f"WebSocket subscription failed: {error_code} - {message}")
+        if callable(on_failure):
+            on_failure(error_code, message)
+
+    def on_open():
+        logging.info(f"WebSocket connection opened for {len(symbols)} symbols")
+        try:
+            ws_client.subscribe(symbols=symbols, data_type=data_type)
+            logging.info(f"Subscription requested for symbols: {symbols}")
+            if callable(on_success):
+                on_success({"status": "Subscription requested", "symbols": symbols})
+        except Exception as e:
+            logging.error(f"Error subscribing to symbols: {str(e)}")
+            if callable(on_failure):
+                on_failure("ERROR", str(e))
+
+    def heartbeat_thread(ws_client):
+        while True:
+            now = time.time()
+            if now - last_ping_time[0] > heartbeat_interval:
+                try:
+                    if hasattr(ws_client, 'ping'):
+                        ws_client.ping()
+                        logging.info("WebSocket ping sent.")
+                    last_ping_time[0] = now
+                except Exception as e:
+                    logging.warning(f"WebSocket ping failed: {e}")
+            time.sleep(heartbeat_interval)
+
+    def connect_with_retries():
+        nonlocal backoff
+        while True:
+            try:
+                ws_client = data_ws.FyersDataSocket(
+                    access_token=f"{client_id}:{access_token}",
+                    log_path="logs/",
+                    litemode=False,
+                    write_to_file=False,
+                    reconnect=False,  # We'll handle reconnection
+                    on_connect=on_open,
+                    on_close=on_close,
+                    on_error=on_error,
+                    on_message=on_message
+                )
+                ws_client.connect()
+                ws_client.market_data = market_data_df
+                ws_client.tick_queue = tick_queue
+                if not hasattr(ws_client, 'close_connection'):
+                    def close_connection():
+                        try:
+                            logging.info("Closing websocket connection...")
+                            ws_client.terminate()
+                            logging.info("Websocket connection terminated")
+                        except Exception as e:
+                            logging.error(f"Error terminating websocket: {str(e)}")
+                    ws_client.close_connection = close_connection
+                threading.Thread(target=heartbeat_thread, args=(ws_client,), daemon=True).start()
+                return ws_client
+            except Exception as e:
+                logging.error(f"WebSocket connection failed: {e}. Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff = min(max_delay, backoff * 2 + random.uniform(0, 1))
+
+    ws_client = connect_with_retries()
+    return ws_client
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws, order_ws
 import logging
 import datetime
 import time
 import pandas as pd
+import threading
+import queue
+import random
 from src.config import load_config
 from src.token_helper import ensure_valid_token
 
@@ -299,120 +432,14 @@ def start_market_data_websocket(symbols, callback_handler=None, data_type="Symbo
     Returns:
         WebSocket connection object
     """
-    try:
-        config = load_config()
-        client_id = config['fyers']['client_id']
-        access_token = ensure_valid_token()
-        
-        # Initialize DataFrame with columns for tracking live market data
-        # Define expected columns from Fyers API response
-        expected_columns = [
-            'ltp', 'vol_traded_today', 'last_traded_time', 'exch_feed_time',
-            'bid_size', 'ask_size', 'bid_price', 'ask_price', 
-            'last_traded_qty', 'tot_buy_qty', 'tot_sell_qty', 'avg_trade_price',
-            'low_price', 'high_price', 'open_price', 'prev_close_price', 'symbol'
-        ]
-        market_data_df = pd.DataFrame(columns=expected_columns)
-        market_data_df.set_index('symbol', inplace=True)
-        
-        # Pre-populate the DataFrame with the symbols we'll be tracking
-        for symbol in symbols:
-            market_data_df.loc[symbol] = [None] * (len(expected_columns) - 1)
-        
-        def on_message(ticks):
-            # Process tick data and update the DataFrame
-            if ticks.get('symbol'):
-                symbol = ticks.get('symbol')
-                
-                # Better logging for option symbol identification
-                is_option = "CE" in symbol or "PE" in symbol
-                
-                # Update all key-value pairs in the DataFrame
-                for key, value in ticks.items():
-                    if key != 'symbol':  # Skip symbol as it's the index
-                        try:
-                            market_data_df.loc[symbol, key] = value
-                        except Exception as e:
-                            logging.warning(f"Failed to update DataFrame for {symbol} - {key}: {e}")
-                    
-                    # Call the callback function if provided
-                    if callback_handler:
-                        callback_handler(symbol, key, value, ticks)
-                        
-                # Log the LTP (Last Traded Price) if available
-                if 'ltp' in ticks:
-                    if is_option:
-                        logging.info(f"WebSocket option tick: {symbol} LTP: {ticks['ltp']}")
-                    else:
-                        logging.info(f"WebSocket tick: {symbol} LTP: {ticks['ltp']}")
-            
-        def on_error(error):
-            logging.error(f"WebSocket error: {error}")
-            
-        def on_close(message):
-            logging.info(f"WebSocket connection closed: {message}")
-            
-        def on_subscribe_success(response):
-            logging.info(f"WebSocket subscription success: {response}")
-            if callable(on_success):
-                on_success(response)
-        
-        def on_subscribe_failure(error_code, message):
-            logging.error(f"WebSocket subscription failed: {error_code} - {message}")
-            if callable(on_failure):
-                on_failure(error_code, message)
-        
-        def on_open():
-            logging.info(f"WebSocket connection opened for {len(symbols)} symbols")
-            # Subscribe to symbols (without success/failure callbacks - Fyers API doesn't support these)
-            try:
-                # Don't pass the on_success/on_failure callbacks - Fyers API doesn't support them
-                ws_client.subscribe(symbols=symbols, data_type=data_type)
-                logging.info(f"Subscription requested for symbols: {symbols}")
-                # Call our success callback manually if provided
-                if callable(on_success):
-                    on_success({"status": "Subscription requested", "symbols": symbols})
-            except Exception as e:
-                logging.error(f"Error subscribing to symbols: {str(e)}")
-                # Call our failure callback manually if provided
-                if callable(on_failure):
-                    on_failure("ERROR", str(e))
-        
-        # Initialize WebSocket with improved reconnection logic
-        ws_client = data_ws.FyersDataSocket(
-            access_token=f"{client_id}:{access_token}",
-            log_path="logs/",
-            litemode=False,
-            write_to_file=False,
-            reconnect=True,
-            on_connect=on_open,
-            on_close=on_close,
-            on_error=on_error,
-            on_message=on_message
-        )
-        
-        # Connect to the WebSocket server
-        ws_client.connect()
-        
-        # Attach the DataFrame to the client for access from outside
-        ws_client.market_data = market_data_df
-        
-        # Add a proper close method if not present
-        if not hasattr(ws_client, 'close_connection'):
-            def close_connection():
-                try:
-                    logging.info("Closing websocket connection...")
-                    ws_client.terminate()
-                    logging.info("Websocket connection terminated")
-                except Exception as e:
-                    logging.error(f"Error terminating websocket: {str(e)}")
-            
-            ws_client.close_connection = close_connection
-        
-        return ws_client
-    except Exception as e:
-        logging.error(f"Error starting market data WebSocket: {str(e)}")
-        return None
+    # Redirect to robust implementation
+    return robust_market_data_websocket(
+        symbols,
+        callback_handler=callback_handler,
+        data_type=data_type,
+        on_success=on_success,
+        on_failure=on_failure
+    )
 
 def get_nifty_spot_price():
     """

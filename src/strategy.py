@@ -187,6 +187,33 @@ class OpenInterestStrategy:
             logging.error(f"Error identifying high OI strikes: {str(e)}")
             return False
     
+    def _start_tick_queue_consumer(self):
+        """Start a background thread to consume ticks from the WebSocket tick_queue."""
+        if not self.data_socket or not hasattr(self.data_socket, 'tick_queue'):
+            logging.warning("No tick_queue found on data_socket; skipping tick consumer thread.")
+            return
+        if hasattr(self, '_tick_consumer_thread') and self._tick_consumer_thread and self._tick_consumer_thread.is_alive():
+            logging.info("Tick consumer thread already running.")
+            return
+        import threading
+        def tick_consumer():
+            logging.info("Tick queue consumer thread started.")
+            while self.data_socket and hasattr(self.data_socket, 'tick_queue'):
+                try:
+                    tick = self.data_socket.tick_queue.get(timeout=2)
+                    symbol = tick.get('symbol')
+                    ltp = tick.get('ltp')
+                    if symbol and ltp is not None:
+                        self.live_prices[symbol] = float(ltp)
+                        if self.active_trade and symbol == self.active_trade.get('symbol'):
+                            self.active_trade['last_known_price'] = float(ltp)
+                except Exception as e:
+                    # Timeout or queue empty is normal; log only real errors
+                    if 'Empty' not in str(type(e)):
+                        logging.debug(f"Tick queue consumer error: {e}")
+        self._tick_consumer_thread = threading.Thread(target=tick_consumer, name="TickQueueConsumer", daemon=True)
+        self._tick_consumer_thread.start()
+
     def monitor_for_breakout(self):
         """Continuously monitor option premiums for breakout using websocket for real-time data"""
         try:
@@ -195,39 +222,15 @@ class OpenInterestStrategy:
                 put_symbol = self.highest_put_oi_symbol
                 call_symbol = self.highest_call_oi_symbol
                 nifty_symbol = "NSE:NIFTY50-INDEX"
-                
                 symbols_to_monitor = [put_symbol, call_symbol, nifty_symbol]
                 logging.info(f"Starting websocket connection for breakout monitoring: {symbols_to_monitor}")
-                
-                # Define callback to handle websocket data for breakout monitoring
                 def ws_breakout_handler(symbol, key, value, tick_data):
                     if key == 'ltp':
-                        # Update the live prices dictionary
                         self.live_prices[symbol] = float(value)
-                        
-                        # Check for breakouts when price updates come in
-                        if symbol == put_symbol:
-                            current_put_premium = float(value)
-                            if (current_put_premium >= self.put_breakout_level and 
-                                current_put_premium >= self.min_premium_threshold and 
-                                not self.active_trade):
-                                logging.info(f"PUT BREAKOUT DETECTED via WebSocket: {symbol} at premium {current_put_premium}")
-                                self.entry_time = self.get_ist_datetime()
-                                self.execute_trade(symbol, "BUY", current_put_premium)
-                                
-                        elif symbol == call_symbol:
-                            current_call_premium = float(value)
-                            if (current_call_premium >= self.call_breakout_level and 
-                                current_call_premium >= self.min_premium_threshold and
-                                not self.active_trade):
-                                logging.info(f"CALL BREAKOUT DETECTED via WebSocket: {symbol} at premium {current_call_premium}")
-                                self.entry_time = self.get_ist_datetime()
-                                self.execute_trade(symbol, "BUY", current_call_premium)
-                
-                # Start websocket connection
                 from src.fyers_api_utils import start_market_data_websocket
                 self.data_socket = start_market_data_websocket(symbols=symbols_to_monitor, callback_handler=ws_breakout_handler)
                 logging.info("WebSocket connection established for breakout monitoring")
+                self._start_tick_queue_consumer()
             
             # Also poll for breakouts as a fallback in case websocket fails
             def monitor_loop():
@@ -810,7 +813,7 @@ class OpenInterestStrategy:
             thread = threading.Thread(target=monitor_thread, name="PositionMonitor")
             thread.daemon = True  # Thread will exit when main program exits
             thread.start()
-            
+            self._start_tick_queue_consumer()
             logging.info("Continuous position monitoring started - updates every second")
             return thread
             
