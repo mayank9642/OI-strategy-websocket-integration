@@ -152,12 +152,4 @@ def run_scheduled():
         return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Open Interest Option Trading Strategy")
-    parser.add_argument('--immediate', '-i', action='store_true', help='Run strategy immediately (skip 9:20 AM check)')
-    args = parser.parse_args()
-    
-    if args.immediate:
-        run_immediate()
-    else:
-        run_scheduled()
+    main()
