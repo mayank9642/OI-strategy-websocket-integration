@@ -917,45 +917,31 @@ class OpenInterestStrategy:
         # Get the trailing stop percentage from config
         config = load_config()
         trailing_stop_pct = config.get('strategy', {}).get('trailing_stop_pct', 10)
-        
-        # Only update if price has moved significantly in our favor
+
         entry_price = self.active_trade['entry_price']
-        
+        symbol = self.active_trade['symbol']
+        current_sl = self.active_trade['stoploss']
+
         # Store the original stoploss if not already stored
         if 'original_stoploss' not in self.active_trade:
             self.active_trade['original_stoploss'] = self.active_trade['stoploss']
-            
+
         original_stoploss = self.active_trade['original_stoploss']
-        
-        # Never move the stoploss below the original stop loss
-        # Calculate potential new stoploss based on current price
-        if self.active_trade['symbol'].endswith('CE'):  # Call option
-            # For call options, price needs to go up for profit
-            # Calculate the trailing stop as a percentage below current price
-            potential_stoploss = current_price * (1 - (trailing_stop_pct / 100))
-            
-            # Only update if the new stop loss would be higher than the current one
-            # and never go below the original stop loss
-            if potential_stoploss > self.active_trade['stoploss'] and potential_stoploss > original_stoploss:
-                old_sl = self.active_trade['stoploss']
-                self.active_trade['stoploss'] = potential_stoploss
-                # Calculate how much profit is now locked in
-                profit_locked_pct = ((potential_stoploss - entry_price) / entry_price) * 100
-                logging.info(f"TRAILING SL | Updated from {old_sl:.2f} to {potential_stoploss:.2f} | " +
-                             f"Current price: {current_price:.2f} | Profit locked: {profit_locked_pct:.2f}%")
-        else:  # Put option
-            # For put options, price needs to go down for profit (opposite logic)
-            # For puts, we'd need to move the stop loss down as price decreases
-            # This is the reverse of call options
-            potential_stoploss = current_price * (1 + (trailing_stop_pct / 100))
-            
-            # For puts, we want to lower the stop loss (not raise it)
-            if potential_stoploss < self.active_trade['stoploss'] and potential_stoploss < original_stoploss:
-                old_sl = self.active_trade['stoploss']
-                self.active_trade['stoploss'] = potential_stoploss
-                profit_locked_pct = ((entry_price - potential_stoploss) / entry_price) * 100
-                logging.info(f"TRAILING SL | Updated from {old_sl:.2f} to {potential_stoploss:.2f} | " +
-                             f"Current price: {current_price:.2f} | Profit locked: {profit_locked_pct:.2f}%")
+
+        # Debug logging for diagnosis
+        logging.info(f"TRAILING SL DEBUG | symbol: {symbol} | entry_price: {entry_price} | current_price: {current_price} | trailing_stop_pct: {trailing_stop_pct} | current_sl: {current_sl} | original_stoploss: {original_stoploss}")
+
+        # For both CE and PE (when long), the stoploss should trail upwards as price increases
+        potential_stoploss = current_price * (1 - (trailing_stop_pct / 100))
+        logging.info(f"TRAILING SL DEBUG | [LONG] potential_stoploss: {potential_stoploss}")
+        if potential_stoploss > current_sl and potential_stoploss > original_stoploss:
+            old_sl = self.active_trade['stoploss']
+            self.active_trade['stoploss'] = potential_stoploss
+            profit_locked_pct = ((potential_stoploss - entry_price) / entry_price) * 100
+            logging.info(f"TRAILING SL | Updated from {old_sl:.2f} to {potential_stoploss:.2f} | " +
+                         f"Current price: {current_price:.2f} | Profit locked: {profit_locked_pct:.2f}%")
+        else:
+            logging.info(f"TRAILING SL DEBUG | [LONG] No update: potential_stoploss ({potential_stoploss}) <= current_sl ({current_sl}) or original_stoploss ({original_stoploss})")
     
     def check_partial_exit(self, current_time, current_price):
         """Check if we should take partial profit based on time elapsed"""
@@ -1142,11 +1128,11 @@ class OpenInterestStrategy:
             logging.error(f"Error in run_strategy: {str(e)}")
     
     def save_trade_history(self):
-        """Save trade history to both CSV and Excel files with enhanced formatting"""
+        """Append all trades to a single Excel file (logs/trade_history.xlsx) and update CSV as well."""
         try:
+            import openpyxl
             # Create DataFrame from trade history
             df = pd.DataFrame(self.trade_history)
-            
             # If there are no trades, just create files with headers
             if len(df) == 0:
                 df = pd.DataFrame(columns=[
@@ -1154,38 +1140,21 @@ class OpenInterestStrategy:
                     'exit_price', 'quantity', 'stoploss', 'target', 'paper_trade', 
                     'pnl', 'exit_reason'
                 ])
-            
             # Save to CSV (keep for compatibility)
             df.to_csv('logs/trade_history.csv', index=False)
-            
-            # Generate Excel filename with current date
-            today = date.today().strftime("%Y%m%d")
-            excel_path = f'logs/trade_history_{today}.xlsx'
-            
             # Prepare enhanced data for Excel with all requested columns
             excel_data = []
             index_value = "NIFTY"  # Default index
-            
             for trade in self.trade_history:
                 direction = "PUT" if "PE" in trade['symbol'] else "CALL"
                 entry_datetime = f"{trade['date']} {trade['entry_time']}"
                 exit_datetime = f"{trade['date']} {trade.get('exit_time', 'N/A')}" if trade.get('exit_time') else "N/A"
-                
-                # Calculate brokerage (estimated at 0.05% of trade value)
                 entry_value = trade['entry_price'] * trade['quantity']
                 brokerage = round(entry_value * 0.0005, 2)  # 0.05%
-                
-                # Calculate margin required (roughly 25% of notional for options)
                 margin_required = round(entry_value * 0.25, 2)
-                
-                # Calculate P&L and gain/loss percentage
                 pnl = trade.get('pnl', 0) if trade.get('pnl') is not None else 0
                 pnl_percent = trade.get('pnl_percent', 0) if trade.get('pnl_percent') is not None else 0
-                
-                # Add trailing stoploss if available
                 trailing_sl = trade.get('trailing_stoploss', trade['stoploss'])
-                
-                # Create row for Excel
                 row = {
                     'Entry DateTime': entry_datetime,
                     'Index': index_value,
@@ -1204,69 +1173,31 @@ class OpenInterestStrategy:
                     '% Gain/Loss': f"{pnl_percent:.2f}%" if isinstance(pnl_percent, (int, float)) else 'N/A'
                 }
                 excel_data.append(row)
-            
-            # Create enhanced DataFrame
             enhanced_df = pd.DataFrame(excel_data)
-            
-            # Create a writer to output the Excel file with formatting
-            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
-                
-                # Get the workbook and the worksheet
-                workbook = writer.book
-                worksheet = writer.sheets['Trade History']
-                
-                # Format headers - make them bold and color the background
-                from openpyxl.styles import Font, PatternFill, Alignment
-                
-                header_font = Font(bold=True, color='FFFFFF')
-                header_fill = PatternFill(start_color='4F81BD', end_color='4F81BD', fill_type='solid')
-                header_alignment = Alignment(horizontal='center', vertical='center')
-                
-                # Apply header style to first row
-                for col_num, column_title in enumerate(enhanced_df.columns, 1):
-                    cell = worksheet.cell(row=1, column=col_num)
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.alignment = header_alignment
-                
-                # Apply number formatting to relevant columns
-                for row in range(2, len(enhanced_df) + 2):  # +2 because Excel is 1-based and we have a header row
-                    for col, col_name in enumerate(enhanced_df.columns, 1):
-                        cell = worksheet.cell(row=row, column=col)
-                        
-                        # Apply specific formatting based on column
-                        if col_name in ['Entry Price', 'Exit Price', 'P&L', 'Brokerage', 'Margin Required']:
-                            if isinstance(cell.value, (int, float)):
-                                cell.number_format = '#,##0.00'
-                                
-                        elif col_name == '% Gain/Loss':
-                            # Remove the % symbol which we added in the dataframe
-                            if isinstance(cell.value, str) and cell.value.endswith('%'):
-                                try:
-                                    cell.value = float(cell.value.rstrip('%')) / 100
-                                    cell.number_format = '0.00%'
-                                except:
-                                    pass
-                
-                # Auto-adjust column width based on content
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = (max_length + 2)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-            
-            logging.info(f"Trade history saved to {excel_path}")
-            
+            excel_path = 'logs/trade_history.xlsx'
+            # If the file exists, append new rows (without duplicating header)
+            if os.path.exists(excel_path):
+                try:
+                    book = openpyxl.load_workbook(excel_path)
+                    writer = pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='overlay')
+                    writer.book = book
+                    if 'Trade History' in book.sheetnames:
+                        startrow = book['Trade History'].max_row
+                    else:
+                        startrow = 0
+                    enhanced_df.to_excel(writer, index=False, sheet_name='Trade History', header=(startrow==0), startrow=startrow)
+                    writer.close()
+                except Exception as e:
+                    logging.error(f"Error appending to Excel: {e}")
+                    # fallback: overwrite
+                    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                        enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
+            else:
+                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                    enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
+            logging.info(f"Trade history appended to {excel_path}")
         except Exception as e:
             logging.error(f"Error saving trade history to Excel: {e}")
-            # Fallback to CSV only
             pd.DataFrame(self.trade_history).to_csv('logs/trade_history.csv', index=False)
             logging.info("Trade history saved to CSV only due to Excel error")
     

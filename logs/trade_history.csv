@@ -1,1 +1,2 @@
-date,symbol,entry_time,exit_time,entry_price,exit_price,quantity,stoploss,target,paper_trade,pnl,exit_reason
+date,symbol,entry_time,entry_price,quantity,stoploss,target,paper_trade
+2025-07-03,NSE:NIFTY2571025500PE,09:22:19,150.0,75,120.0,210.0,True
