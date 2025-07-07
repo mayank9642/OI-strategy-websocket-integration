@@ -7,6 +7,8 @@ import json
 import os
 import pytz
 import threading
+import queue
+import re
 from datetime import date
 from src.fyers_api_utils import (
     get_fyers_client, place_market_order, modify_order, exit_position,
@@ -118,34 +120,92 @@ class OpenInterestStrategy:
             if today.weekday() > 4:  # Saturday or Sunday
                 logging.warning("Markets are closed today (weekend). Skipping analysis.")
                 return False
+                
+            # Get the Nifty option chain
+            logging.info("Fetching option chain data for analysis...")
+            option_chain = get_nifty_option_chain()
             
-            # Check if it's a market holiday (simplified check)
-            # In a production system, you would have a list of market holidays
-            holiday_names = ["Republic Day", "Independence Day", "Gandhi Jayanti", "Christmas"]
-            holiday_dates = ["26/01", "15/08", "02/10", "25/12"]
-            current_date = today.strftime("%d/%m")
-            
-            if current_date in holiday_dates:
-                holiday_name = holiday_names[holiday_dates.index(current_date)]
-                logging.warning(f"Markets are closed today ({holiday_name}). Skipping analysis.")
+            if option_chain is None or option_chain.empty:
+                logging.error("Failed to fetch option chain data")
                 return False
-            
-            # Get current Nifty spot price for evaluating ATM distance
-            spot_price = get_nifty_spot_price()
-            if spot_price == 0:
-                logging.error("Failed to get Nifty spot price for strike distance evaluation")
-                return False
-            
+                
+            # Get current Nifty spot price
+            spot_price = option_chain['spot_price'].iloc[0]
             logging.info(f"Current Nifty spot price: {spot_price}")
             
-            # Initialize variables for tracking which expiry was used
-            current_expiry_index = 0
+            # Find suitable strikes
+            return self._find_suitable_strikes(0, spot_price)
+        except Exception as e:
+            logging.error(f"Error identifying high OI strikes: {str(e)}")
+            return False
+
+    def _find_suitable_strikes(self, expiry_index=0, spot_price=None):
+        """Find suitable strikes for the given expiry index"""
+        try:
+            option_chain = get_nifty_option_chain(expiry_index)
+            
+            if option_chain is None or option_chain.empty:
+                logging.error(f"Failed to fetch option chain for expiry index {expiry_index}")
+                return False
+                
+            if spot_price is None:
+                spot_price = option_chain['spot_price'].iloc[0]
+            
+            # Identify ATM strike (closest to spot price)
+            atm_strike = round(spot_price / 100) * 100
+            
+            # Filter by distance from ATM
+            max_distance = self.max_strike_distance  # Max distance from ATM
+            filtered_chain = option_chain[(option_chain['strikePrice'] >= atm_strike - max_distance) & 
+                                         (option_chain['strikePrice'] <= atm_strike + max_distance)]
+            
+            if filtered_chain.empty:
+                logging.warning(f"No options found within {max_distance} points of ATM. Using full chain.")
+                filtered_chain = option_chain
+            
+            # Find strike with highest put OI
+            put_chain = filtered_chain[filtered_chain['option_type'] == 'PE']
+            if not put_chain.empty:
+                put_oi_sorted = put_chain.sort_values('openInterest', ascending=False)
+                
+                # Get the highest OI PUT strike
+                self.highest_put_oi_strike = int(put_oi_sorted['strikePrice'].iloc[0])
+                
+                # Get PUT premium
+                self.put_premium_at_9_20 = float(put_oi_sorted[put_oi_sorted['strikePrice'] == self.highest_put_oi_strike]['lastPrice'].iloc[0])
+                
+                # Get symbol
+                self.highest_put_oi_symbol = put_oi_sorted[put_oi_sorted['strikePrice'] == self.highest_put_oi_strike]['symbol'].iloc[0]
+                
+                # Log important information only
+                logging.info(f"Highest PUT OI Strike: {self.highest_put_oi_strike}, Premium: {self.put_premium_at_9_20}, Symbol: {self.highest_put_oi_symbol}")
+            else:
+                logging.error("No PUT options found in filtered chain")
+                return False
+            
+            # Find strike with highest call OI
+            call_chain = filtered_chain[filtered_chain['option_type'] == 'CE']
+            if not call_chain.empty:
+                call_oi_sorted = call_chain.sort_values('openInterest', ascending=False)
+                
+                # Get the highest OI CALL strike
+                self.highest_call_oi_strike = int(call_oi_sorted['strikePrice'].iloc[0])
+                
+                # Get CALL premium
+                self.call_premium_at_9_20 = float(call_oi_sorted[call_oi_sorted['strikePrice'] == self.highest_call_oi_strike]['lastPrice'].iloc[0])
+                
+                # Get symbol
+                self.highest_call_oi_symbol = call_oi_sorted[call_oi_sorted['strikePrice'] == self.highest_call_oi_strike]['symbol'].iloc[0]
+                
+                # Log important information only
+                logging.info(f"Highest CALL OI Strike: {self.highest_call_oi_strike}, Premium: {self.call_premium_at_9_20}, Symbol: {self.highest_call_oi_symbol}")
+                logging.info(f"Highest CE OI details: {{'strikePrice': {self.highest_call_oi_strike}, 'symbol': '{self.highest_call_oi_symbol}', 'lastPrice': {self.call_premium_at_9_20}, 'openInterest': {int(call_oi_sorted['openInterest'].iloc[0])}}}")
+            else:
+                logging.error("No CALL options found in filtered chain")
+                return False
+                
+            # Check if premiums are too low (filter out options with very low premiums)
             next_expiry_tried = False
-            
-            # Try current expiry first
-            option_chain = self._find_suitable_strikes(current_expiry_index, spot_price)
-            
-            # If initial strike selection has premiums < threshold, try 2nd highest OI strikes
             if (self.put_premium_at_9_20 < self.min_premium_threshold or 
                 self.call_premium_at_9_20 < self.min_premium_threshold):
                 logging.info("First highest OI strikes have premiums below threshold, checking 2nd highest OI strikes...")
@@ -184,9 +244,9 @@ class OpenInterestStrategy:
             
             return option_chain
         except Exception as e:
-            logging.error(f"Error identifying high OI strikes: {str(e)}")
+            logging.error(f"Error finding suitable strikes: {str(e)}")
             return False
-    
+            
     def _start_tick_queue_consumer(self):
         """Start a background thread to consume ticks from the WebSocket tick_queue."""
         if not self.data_socket or not hasattr(self.data_socket, 'tick_queue'):
@@ -198,6 +258,8 @@ class OpenInterestStrategy:
         import threading
         def tick_consumer():
             logging.info("Tick queue consumer thread started.")
+            ticks_received = 0
+            start_time = time.time()
             while self.data_socket and hasattr(self.data_socket, 'tick_queue'):
                 try:
                     tick = self.data_socket.tick_queue.get(timeout=2)
@@ -207,6 +269,13 @@ class OpenInterestStrategy:
                         self.live_prices[symbol] = float(ltp)
                         if self.active_trade and symbol == self.active_trade.get('symbol'):
                             self.active_trade['last_known_price'] = float(ltp)
+                    ticks_received += 1
+                    # Log WebSocket statistics periodically
+                    elapsed = time.time() - start_time
+                    if elapsed >= 60:  # Every minute
+                        logging.info(f"WebSocket stats: {ticks_received} ticks in {elapsed:.1f}s ({ticks_received/elapsed:.1f} ticks/sec)")
+                        ticks_received = 0
+                        start_time = time.time()
                 except Exception as e:
                     # Timeout or queue empty is normal; log only real errors
                     if 'Empty' not in str(type(e)):
@@ -415,6 +484,83 @@ class OpenInterestStrategy:
         if not self.active_trade:
             return
         
+        # Market hours check at the top of the function to ensure hard exit enforcement
+        ist_now = self.get_ist_datetime()
+        market_close_time = datetime.time(15, 30)  # 3:30 PM IST
+        
+        # Also check 30-minute max duration at the top level to ensure strict enforcement
+        if self.active_trade and self.active_trade.get('entry_time'):
+            entry_time = self.active_trade['entry_time']
+            current_timestamp = ist_now.timestamp()
+            entry_timestamp = entry_time.timestamp() if hasattr(entry_time, 'timestamp') else 0
+            elapsed_minutes = (current_timestamp - entry_timestamp) / 60
+            
+            # If trade has been running for more than 30 minutes, force exit
+            if elapsed_minutes > 30:
+                logging.warning(f"HARD ENFORCEMENT: Trade has been running for {elapsed_minutes:.2f} minutes, exceeding 30-minute limit. Forcing exit.")
+                symbol = self.active_trade['symbol']
+                # Try to get latest price
+                current_price = self.active_trade.get('last_known_price', self.active_trade.get('entry_price', 0))
+                if symbol in self.live_prices:
+                    current_price = self.live_prices[symbol]
+                    
+                exit_type = "MAX_DURATION"
+                exit_price = current_price
+                
+                # Execute exit
+                is_paper_trade = self.active_trade.get('paper_trade', self.paper_trading)
+                exit_response = {'s': 'ok', 'id': f'PAPER-EXIT-{int(time.time())}'}
+                if not is_paper_trade:
+                    from src.fyers_api_utils import exit_position
+                    exit_response = exit_position(self.fyers, symbol, self.active_trade['quantity'], "SELL")
+                
+                # Process the exit
+                self.process_exit(exit_type, exit_price, exit_response)
+                return
+        
+        # Force exit positions at market close
+        if ist_now.time() >= market_close_time and self.active_trade:
+            logging.warning("MARKET CLOSING: Forcing exit of all positions")
+            symbol = self.active_trade['symbol']
+            
+            # Try to get the most recent price
+            current_price = None
+            if symbol in self.live_prices:
+                current_price = self.live_prices[symbol]
+            else:
+                try:
+                    from src.fyers_api_utils import get_ltp
+                    current_price = get_ltp(self.fyers, symbol)
+                except Exception as e:
+                    logging.error(f"Error getting price at market close: {str(e)}")
+                
+            # If we still don't have a price, use the last known price
+            if current_price is None:
+                current_price = self.active_trade.get('last_known_price', 
+                                                    self.active_trade.get('entry_price', 0))
+                logging.warning(f"Using fallback price for market close exit: {current_price}")
+                
+            # Force exit at market close
+            exit_type = "MARKET_CLOSE"
+            exit_price = current_price
+            logging.info(f"MARKET CLOSE EXIT: Exiting {symbol} at {current_price}")
+            
+            # Execute the exit
+            is_paper_trade = self.active_trade.get('paper_trade', self.paper_trading)
+            if is_paper_trade:
+                exit_response = {'s': 'ok', 'id': f'PAPER-EXIT-{int(time.time())}'}
+            else:
+                # For live trading, execute a market order to close the position
+                try:
+                    exit_response = self.place_market_order(symbol, "SELL", self.active_trade['quantity'])
+                except Exception as e:
+                    logging.error(f"Error placing market close exit order: {str(e)}")
+                    exit_response = {'s': 'error', 'message': str(e)}
+            
+            # Process the exit
+            self.process_exit(exit_type, exit_price, exit_response)
+            return
+            
         # Log once every 5 seconds to confirm monitor is running
         should_log_heartbeat = (int(time.time()) % 5 == 0)
         if should_log_heartbeat:
@@ -599,11 +745,36 @@ class OpenInterestStrategy:
                 exit_price = current_price
                 logging.info(f"TARGET HIT: Exiting {symbol} at {current_price}")
                 
-            # 3. Time-based exit
-            elif current_time >= self.active_trade['exit_time']:
-                exit_type = "TIME"
+            # 3. Time-based exit (check against both exit time and market close)
+            # Ensure consistent datetime comparison by normalizing both times
+            exit_time = self.active_trade['exit_time']
+            
+            # Convert to timestamp for reliable comparison (avoids timezone issues)
+            current_timestamp = current_time.timestamp()
+            exit_timestamp = exit_time.timestamp() if hasattr(exit_time, 'timestamp') else 0
+            entry_timestamp = self.active_trade['entry_time'].timestamp() if hasattr(self.active_trade['entry_time'], 'timestamp') else 0
+            
+            # Calculate elapsed minutes since entry for logging and decision making
+            elapsed_minutes = (current_timestamp - entry_timestamp) / 60
+            
+            # Check exit conditions with more explicit logging
+            time_limit_exceeded = current_timestamp >= exit_timestamp
+            max_trade_duration_exceeded = elapsed_minutes >= 30
+            market_closing_soon = current_time.time() >= datetime.time(15, 25)
+            
+            if time_limit_exceeded or max_trade_duration_exceeded or market_closing_soon:
+                # Determine the appropriate exit type based on conditions
+                if market_closing_soon and current_time.time() < datetime.time(15, 30):
+                    exit_type = "MARKET_CLOSING"
+                    logging.info(f"MARKET CLOSING SOON: Exiting {symbol} at {current_price} before market close")
+                elif max_trade_duration_exceeded:
+                    exit_type = "MAX_DURATION"
+                    logging.info(f"MAX DURATION EXCEEDED: Exiting {symbol} at {current_price} after {elapsed_minutes:.2f} minutes (30-min limit enforced)")
+                else:
+                    exit_type = "TIME"
+                    logging.info(f"TIME EXIT: Exiting {symbol} at {current_price} after {elapsed_minutes:.2f} minutes")
+                
                 exit_price = current_price
-                logging.info(f"TIME EXIT: Exiting {symbol} at {current_price}")
             
             # Process exit if conditions are met
             if exit_type:
@@ -616,87 +787,112 @@ class OpenInterestStrategy:
                     # Place real exit order
                     exit_response = exit_position(self.fyers, self.active_trade['symbol'], quantity, "SELL")
                 
-                if exit_response and exit_response.get('s') == 'ok':
-                    # Calculate final P&L
-                    entry_value = entry_price * quantity
-                    exit_value = exit_price * quantity
-                    realized_pnl = exit_value - entry_value
-                    realized_pnl_pct = (realized_pnl / entry_value) * 100 if entry_value > 0 else 0
-                    
-                    # Log exit details
-                    duration = current_time - self.active_trade['entry_time']
-                    duration_minutes = duration.total_seconds() / 60
-                    
-                    logging.info(f"=== {'PAPER' if is_paper_trade else 'LIVE'} TRADE EXITED: {exit_type} ===")
-                    logging.info(f"Symbol: {symbol}")
-                    logging.info(f"Entry Price: {entry_price}")
-                    logging.info(f"Exit Price: {exit_price}")
-                    logging.info(f"Quantity: {quantity}")
-                    logging.info(f"P&L: {realized_pnl:.2f} ({realized_pnl_pct:.2f}%)")
-                    logging.info(f"Duration: {duration_minutes:.1f} minutes")
-                    logging.info(f"========================")
-                    
-                    # Update trade history
-                    for trade in self.trade_history:
-                        # Format entry time properly based on its type
-                        entry_time_str = self.active_trade['entry_time']
-                        trade_entry_time = trade['entry_time']
-                        
-                        # Convert datetime to string if needed for comparison
-                        if isinstance(entry_time_str, datetime.datetime):
-                            entry_time_str = entry_time_str.strftime('%H:%M:%S')
-                        
-                        # Simple string match or check if entry times match approximately
-                        entry_time_match = (trade['symbol'] == symbol and 
-                                          (trade_entry_time == entry_time_str or 
-                                           (isinstance(trade_entry_time, str) and trade_entry_time.split(':')[0:2] == entry_time_str.split(':')[0:2])))
-                            
-                        if entry_time_match:
-                            trade['exit_time'] = current_time.strftime('%H:%M:%S')
-                            trade['exit_price'] = exit_price
-                            trade['exit_type'] = exit_type
-                            trade['pnl'] = realized_pnl
-                            trade['pnl_percent'] = realized_pnl_pct
-                            trade['duration_minutes'] = duration_minutes
-                    
-                    # Save updated trade history
-                    try:
-                        self.save_trade_history()
-                    except AttributeError as e:
-                        logging.error(f"Error saving trade history: {str(e)}")
-                        # Fallback: save directly to CSV
-                        pd.DataFrame(self.trade_history).to_csv('logs/trade_history.csv', index=False)
-                        logging.info("Used fallback method to save trade history to CSV")
-                    
-                    # Record trade performance
-                    trade_data = {
-                        'date': current_time.strftime('%Y-%m-%d'),
-                        'time': current_time.strftime('%H:%M:%S'),
-                        'symbol': symbol,
-                        'option_type': 'CE' if symbol.endswith('CE') else 'PE',
-                        'strike_price': self.active_trade.get('strike_price', 0),
-                        'entry_price': entry_price,
-                        'exit_price': exit_price,
-                        'quantity': quantity,
-                        'pnl': realized_pnl,
-                        'pnl_pct': realized_pnl_pct,
-                        'exit_type': exit_type,
-                        'duration_min': duration_minutes,
-                        'is_paper': is_paper_trade
-                    }
-                    self.track_trade_performance(trade_data)
-                    
-                    # Clear active trade but keep trade_taken_today flag set
-                    self.active_trade = None
-                    
-                    # Log that we've reached the daily trade limit
-                    logging.info("Daily trade limit: No more trades will be taken today.")
-                else:
-                    if not is_paper_trade:  # Only log errors for real trading
-                        logging.error(f"Failed to exit position: {exit_response}")
+                # Use the dedicated process_exit function for consistent handling
+                self.process_exit(exit_type, exit_price, exit_response)
+            return False
         except Exception as e:
-            logging.error(f"Error managing position: {str(e)}")
-            return None
+            logging.error(f"Error in manage_position: {str(e)}")
+            return False
+    
+    def process_exit(self, exit_type, exit_price, exit_response):
+        """Process exit consistently for all exit types (stoploss, target, time, market close)"""
+        if not self.active_trade:
+            logging.warning("No active trade to exit")
+            return
+            
+        if exit_response and exit_response.get('s') == 'ok':
+            symbol = self.active_trade['symbol']
+            quantity = self.active_trade['quantity']
+            entry_price = self.active_trade['entry_price']
+            is_paper_trade = self.active_trade.get('paper_trade', self.paper_trading)
+            current_time = self.get_ist_datetime()
+            
+            # Calculate final P&L
+            entry_value = entry_price * quantity
+            exit_value = exit_price * quantity
+            realized_pnl = exit_value - entry_value
+            realized_pnl_pct = (realized_pnl / entry_value) * 100 if entry_value > 0 else 0
+            
+            # Log exit details
+            duration = current_time - self.active_trade['entry_time']
+            duration_minutes = duration.total_seconds() / 60
+            
+            # Enhanced exit reason logging
+            exit_reason = {
+                'STOPLOSS': 'Stoploss hit',
+                'TARGET': 'Target achieved',
+                'TIME': 'Time limit (30 min) reached',
+                'MAX_DURATION': '30-minute hard limit enforced',
+                'MARKET_CLOSING': 'Market closing soon (15:25)',
+                'MARKET_CLOSE': 'Market closed (15:30)'
+            }.get(exit_type, exit_type)
+            
+            logging.info(f"=== {'PAPER' if is_paper_trade else 'LIVE'} TRADE EXITED: {exit_type} ===")
+            logging.info(f"Exit Reason: {exit_reason}")
+            logging.info(f"Symbol: {symbol}")
+            logging.info(f"Entry Price: {entry_price}")
+            logging.info(f"Exit Price: {exit_price}")
+            logging.info(f"Quantity: {quantity}")
+            logging.info(f"P&L: {realized_pnl:.2f} ({realized_pnl_pct:.2f}%)")
+            logging.info(f"Duration: {duration_minutes:.1f} minutes")
+            logging.info(f"========================")
+            
+            # Update trade history
+            for trade in self.trade_history:
+                # Format entry time properly based on its type
+                entry_time_str = self.active_trade['entry_time']
+                trade_entry_time = trade['entry_time']
+                
+                # Convert datetime to string if needed for comparison
+                if isinstance(entry_time_str, datetime.datetime):
+                    entry_time_str = entry_time_str.strftime('%H:%M:%S')
+                
+                # Simple string match or check if entry times match approximately
+                entry_time_match = (trade['symbol'] == symbol and 
+                                  (trade_entry_time == entry_time_str or 
+                                   (isinstance(trade_entry_time, str) and trade_entry_time.split(':')[0:2] == entry_time_str.split(':')[0:2])))
+                    
+                if entry_time_match:
+                    trade['exit_time'] = current_time.strftime('%H:%M:%S')
+                    trade['exit_price'] = exit_price
+                    trade['exit_type'] = exit_type
+                    trade['pnl'] = realized_pnl
+                    trade['pnl_percent'] = realized_pnl_pct
+                    trade['duration_minutes'] = duration_minutes
+            
+            # Save updated trade history
+            try:
+                self.save_trade_history()
+            except AttributeError as e:
+                logging.error(f"Error saving trade history: {str(e)}")
+                # Fallback: save directly to CSV
+                pd.DataFrame(self.trade_history).to_csv('logs/trade_history.csv', index=False)
+                
+            # Clear the active trade
+            self.active_trade = None
+            
+            # Record performance metrics
+            self.record_performance(symbol, 
+                                   'CE' if symbol.endswith('CE') else 'PE', 
+                                   0,  # This is position_id, typically 0 for paper trades 
+                                   entry_price, 
+                                   exit_price, 
+                                   quantity, 
+                                   realized_pnl, 
+                                   realized_pnl_pct, 
+                                   exit_type, 
+                                   duration_minutes, 
+                                   is_paper_trade)
+            
+            # Clean up resources
+            if hasattr(self, 'tick_queue'):
+                self.tick_queue = queue.Queue()  # Clear any pending ticks
+                
+            return True
+        else:
+            # Handle failed exit attempt
+            logging.error(f"Failed to exit position: {exit_response}")
+            return False
     
     def continuous_position_monitor(self):
         """Monitor active position continuously with second-by-second updates using websocket"""
@@ -764,15 +960,19 @@ class OpenInterestStrategy:
                         unrealized_pnl = current_value - entry_value
                         unrealized_pnl_pct = (unrealized_pnl / entry_value) * 100 if entry_value > 0 else 0
                         
-                        # Add time remaining calculation
+                        # Add time remaining calculation with better warning
                         time_remaining = "N/A"
                         if 'exit_time' in self.active_trade:
                             time_diff = self.active_trade['exit_time'] - current_time
                             if time_diff.total_seconds() > 0:
                                 mins, secs = divmod(time_diff.total_seconds(), 60)
                                 time_remaining = f"{int(mins)}m{int(secs)}s"
+                                # Add warning if approaching 30-minute limit
+                                if mins < 2:
+                                    logging.warning(f"⚠️ TRADE APPROACHING 30-MIN LIMIT: Only {time_remaining} left until forced exit!")
                             else:
-                                time_remaining = "0m0s (expired)"
+                                time_remaining = "0m0s (EXIT DUE)"
+                                logging.warning("⚠️ 30-MINUTE TRADE LIMIT REACHED: Position will exit on next check")
                         
                         # Simple status update with websocket indicator
                         data_source = "WS" if symbol in self.live_prices else "API"
@@ -1084,6 +1284,20 @@ class OpenInterestStrategy:
             # Log IST time for debugging
             logging.info(f"Current IST time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
             
+            # Check if we're running close to market close time (after 15:00)
+            if current_time >= datetime.time(15, 0) and current_time < market_close_time:
+                logging.warning("⚠️ CAUTION: Running strategy after 15:00 IST. Trades will be force-exited at market close (15:30)!")
+                logging.warning("Trades will run for less than the usual 30-minute duration due to market closing soon.")
+                logging.warning("Consider waiting for the next trading day for optimal strategy execution.")
+                
+                # Prompt the user to confirm if they want to continue
+                user_input = input("Do you want to continue running the strategy even though market closes soon? (y/n): ")
+                if user_input.lower() != 'y':
+                    logging.info("Strategy execution cancelled by user. Please run again during market hours.")
+                    return
+                else:
+                    logging.info("User confirmed to run strategy despite approaching market close time.")
+            
             # Check if market is open
             if current_time < market_open_time:
                 logging.info("Waiting for market to open (IST time)...")
@@ -1145,16 +1359,34 @@ class OpenInterestStrategy:
                 ])
             # Save to CSV (keep for compatibility)
             df.to_csv('logs/trade_history.csv', index=False)
+            
             # Prepare enhanced data for Excel with all requested columns
             excel_data = []
             index_value = "NIFTY"  # Default index
+            
+            # Only include complete trades in Excel export (with exit info) or active trades
+            # This prevents duplicate entries with partial information
             for trade in self.trade_history:
+                # Skip trades that don't have exit information unless they're active
+                is_active_trade = self.active_trade and self.active_trade.get('symbol') == trade['symbol']
+                is_complete_trade = 'exit_price' in trade and trade['exit_price'] is not None
+                
+                # Only include trades that are either complete or currently active
+                if not (is_complete_trade or is_active_trade):
+                    continue
+                    
                 direction = "PUT" if "PE" in trade['symbol'] else "CALL"
                 entry_datetime = f"{trade['date']} {trade['entry_time']}"
                 exit_datetime = f"{trade['date']} {trade.get('exit_time', 'N/A')}" if trade.get('exit_time') else "N/A"
                 entry_value = trade['entry_price'] * trade['quantity']
-                brokerage = round(entry_value * 0.0005, 2)  # 0.05%
-                margin_required = round(entry_value * 0.25, 2)
+                # Updated brokerage calculation: 20 Rs per trade (fixed) plus taxes
+                # We're accounting for both entry and exit as separate trades
+                fixed_brokerage = 20 * 2  # 20 Rs per trade (entry + exit)
+                # Rough estimate for STT, CTT, GST, etc. - can be refined if specific rates are needed
+                taxes = round(entry_value * 0.0002, 2)  # Approx. tax impact
+                brokerage = fixed_brokerage + taxes
+                # Update: For options, margin = premium * lot size
+                margin_required = round(trade['entry_price'] * trade['quantity'], 2)
                 pnl = trade.get('pnl', 0) if trade.get('pnl') is not None else 0
                 pnl_percent = trade.get('pnl_percent', 0) if trade.get('pnl_percent') is not None else 0
                 trailing_sl = trade.get('trailing_stoploss', trade['stoploss'])
@@ -1178,26 +1410,23 @@ class OpenInterestStrategy:
                 excel_data.append(row)
             enhanced_df = pd.DataFrame(excel_data)
             excel_path = 'logs/trade_history.xlsx'
-            # If the file exists, append new rows (without duplicating header)
-            if os.path.exists(excel_path):
-                try:
-                    book = openpyxl.load_workbook(excel_path)
-                    writer = pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='overlay')
-                    writer.book = book
-                    if 'Trade History' in book.sheetnames:
-                        startrow = book['Trade History'].max_row
-                    else:
-                        startrow = 0
-                    enhanced_df.to_excel(writer, index=False, sheet_name='Trade History', header=(startrow==0), startrow=startrow)
-                    writer.close()
-                except Exception as e:
-                    logging.error(f"Error appending to Excel: {e}")
-                    # fallback: overwrite
-                    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                        enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
-            else:
-                with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+            # For Excel, either create a new file or completely replace the existing one
+            # This prevents duplicate entries and formatting issues
+            try:
+                # Complete rewrite approach to avoid duplicates and ensure clean data
+                with pd.ExcelWriter(excel_path, engine='openpyxl', mode='w') as writer:
                     enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
+                logging.info(f"Trade history appended to {excel_path}")
+            except Exception as e:
+                logging.error(f"Error writing to Excel: {e}")
+                # Fallback: try to save with a different filename
+                try:
+                    backup_path = f'logs/trade_history_{int(time.time())}.xlsx'
+                    with pd.ExcelWriter(backup_path, engine='openpyxl') as writer:
+                        enhanced_df.to_excel(writer, index=False, sheet_name='Trade History')
+                    logging.info(f"Trade history saved to backup file: {backup_path}")
+                except Exception as backup_error:
+                    logging.error(f"Failed to save trade history to backup Excel: {backup_error}")
             logging.info(f"Trade history appended to {excel_path}")
         except Exception as e:
             logging.error(f"Error saving trade history to Excel: {e}")
@@ -1247,6 +1476,34 @@ class OpenInterestStrategy:
         if put_data.empty:
             logging.error("No put options found in option chain")
             return option_chain
+        
+        # Check if spot_price is provided, otherwise try to extract it from option chain
+        if spot_price is None:
+            try:
+                # Try to get spot_price from option_chain if it exists
+                if 'spot_price' in option_chain.columns and not option_chain['spot_price'].isnull().all():
+                    spot_price = option_chain['spot_price'].iloc[0]
+                elif 'underlyingValue' in option_chain.columns and not option_chain['underlyingValue'].isnull().all():
+                    spot_price = option_chain['underlyingValue'].iloc[0]
+                else:
+                    # Fallback to getting spot price again
+                    from src.fyers_api_utils import get_nifty_spot_price
+                    spot_price = get_nifty_spot_price()
+                logging.info(f"Using spot price: {spot_price} for strike selection")
+            except Exception as e:
+                logging.error(f"Failed to determine spot price: {e}")
+                # Don't return yet, try one more method
+                try:
+                    from src.fyers_api_utils import get_nifty_spot_price
+                    spot_price = get_nifty_spot_price()
+                    if spot_price and spot_price > 0:
+                        logging.info(f"Retrieved spot price directly: {spot_price}")
+                    else:
+                        logging.error("Failed to get valid spot price, cannot filter strikes")
+                        return option_chain
+                except Exception as e2:
+                    logging.error(f"Final attempt to get spot price failed: {e2}")
+                    return option_chain
         
         # Filter by max strike distance - keep this to avoid extremely far OTM strikes
         put_data = put_data[abs(put_data['strikePrice'] - spot_price) <= self.max_strike_distance]
@@ -1397,115 +1654,33 @@ class OpenInterestStrategy:
         from src.fyers_api_utils import get_nifty_spot_price_direct
         return get_nifty_spot_price_direct()
 
-# Current run_strategy method belongs to the OpenInterestStrategy class
-# We need a standalone function for our simulation
-
-def run_strategy(simulated=False):
-    """
-    Standalone function to run the strategy once for testing or simulation
-    
-    Args:
-        simulated: Boolean indicating if this is a simulation run
-    
-    Returns:
-        Dictionary with strategy results
-    """
-    try:
-        logging.info(f"Running {'simulated' if simulated else 'real'} strategy...")
-        
-        # Initialize strategy
-        strategy = OpenInterestStrategy()
-        
-        # For simulation, we'll run a condensed version of the strategy
-        # Step 1: Identify high OI strikes (9:20 AM analysis)
-        option_chain = strategy.identify_high_oi_strikes()
-        
-        # Check if the returned value is a DataFrame and if it's empty
-        if isinstance(option_chain, pd.DataFrame):
-            if option_chain.empty:
-                logging.error("Empty option chain returned from OI analysis")
-                return {"success": False, "message": "Empty option chain returned"}
-        elif not option_chain:  # Handle boolean False or None
-            logging.error("Failed to identify high OI strikes")
-            return {"success": False, "message": "Failed to identify high OI strikes"}
-        
-        # Step 2: Check for breakouts (which would trigger trades)
-        result = strategy.monitor_for_breakout()
-        
-        if result:
-            message = f"Trade triggered: {strategy.active_trade['symbol']}"
-            return {
-                "success": True, 
-                "trade_triggered": True,
-                "symbol": strategy.active_trade['symbol'],
-                "entry_price": strategy.active_trade['entry_price'],
-                "stoploss": strategy.active_trade['stoploss'],
-                "target": strategy.active_trade['target']
-            }
-        else:
-            return {
-                "success": True, 
-                "trade_triggered": False,
-                "message": "No breakout detected",
-                "put_premium": strategy.put_premium_at_9_20,
-                "put_breakout_level": strategy.put_breakout_level,
-                "call_premium": strategy.call_premium_at_9_20,
-                "call_breakout_level": strategy.call_breakout_level
+    def record_performance(self, symbol, option_type, position_id, entry_price, exit_price, quantity, pnl, pnl_pct, exit_type, duration_minutes, is_paper_trade):
+        """Record trade performance metrics for analysis"""
+        try:
+            # Create a data record for the trade
+            trade_data = {
+                'date': self.get_ist_datetime().strftime('%Y-%m-%d'),
+                'time': self.get_ist_datetime().strftime('%H:%M:%S'),
+                'symbol': symbol,
+                'option_type': option_type,
+                'position_id': position_id,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'quantity': quantity,
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'exit_type': exit_type,
+                'duration_minutes': duration_minutes,
+                'is_paper': is_paper_trade
             }
             
-    except Exception as e:
-        logging.error(f"Error in run_strategy: {str(e)}")
-        return {"success": False, "error": str(e)}
-
-def run_strategy_now():
-    """
-    Run the strategy immediately with the current market data,
-    bypassing the 9:20 AM check. This function is useful when 
-    starting the strategy after 9:20 AM.
-    """
-    logging.info("Running strategy with current market data (bypassing 9:20 AM check)...")
-    try:
-        # Initialize strategy
-        strategy = OpenInterestStrategy()
-        
-        # Initialize for the day
-        if not strategy.initialize_day():
-            logging.error("Failed to initialize strategy for the day")
-            return {"success": False, "message": "Failed to initialize strategy"}
+            # Record in performance tracking if needed
+            self.track_trade_performance(trade_data)
+            return True
             
-        # Force the OI analysis regardless of the current time
-        logging.info("Forcing OI analysis with current market data...")
-        option_chain = strategy.identify_high_oi_strikes()
-        
-        # Check if the returned value is a DataFrame and if it's empty
-        if isinstance(option_chain, pd.DataFrame):
-            if option_chain.empty:
-                logging.error("Empty option chain returned from OI analysis")
-                return {"success": False, "message": "Empty option chain returned"}
-        elif not option_chain:  # Handle boolean False or None
-            logging.error("Failed to identify high OI strikes with current data")
-            return {"success": False, "message": "Failed to identify high OI strikes"}
-            
-        # If we have valid strikes, start monitoring for breakouts
-        if strategy.highest_put_oi_strike and strategy.highest_call_oi_strike:
-            logging.info(f"Starting breakout monitoring for PUT strike: {strategy.highest_put_oi_strike} (premium: {strategy.put_premium_at_9_20})")
-            logging.info(f"Starting breakout monitoring for CALL strike: {strategy.highest_call_oi_strike} (premium: {strategy.call_premium_at_9_20})")
-            strategy.monitor_for_breakout()
-        else:
-            logging.error("No valid strikes identified for monitoring")
-            return {"success": False, "message": "No valid strikes identified"}
-            
-        return {"success": True, "message": "Strategy running with current market data"}
-        
-    except Exception as e:
-        logging.error(f"Error in run_strategy_now: {str(e)}")
-        return {"success": False, "error": str(e)}
-
-# When imported, this will not execute automatically
-if __name__ == "__main__":
-    # If run directly, execute the run_strategy_now function
-    result = run_strategy_now()
-    logging.info(f"Strategy execution result: {result}")
+        except Exception as e:
+            logging.error(f"Error recording trade performance: {str(e)}")
+            return False
 
 
 

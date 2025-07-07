@@ -4,12 +4,13 @@ import logging
 import datetime
 import os
 import sys
+import pytz
 
 # Add the parent directory to the system path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Use src namespace for imports
-from src.strategy import OpenInterestStrategy
+from src.strategy import OpenInterestStrategy, run_strategy_now
 from src.config import load_config
 from src.token_helper import ensure_valid_token
 from src.auth import generate_access_token
@@ -31,10 +32,31 @@ def job(strategy):
     except Exception as e:
         logging.error(f"Error in scheduled job: {str(e)}")
 
+def check_past_nine_twenty():
+    """Check if current IST time is past 9:20 AM"""
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.datetime.now(ist)
+    
+    # Check if current time is past 9:20 AM
+    return (now.hour > 9) or (now.hour == 9 and now.minute >= 20)
+
+def prompt_for_immediate_run():
+    """Prompt user if they want to run immediately bypassing 9:20 AM check"""
+    response = input("It is after 9:20 AM IST. Do you want to skip the 9:20 check and run immediately? (y/n): ")
+    return response.lower().startswith('y')
+
 def main():
     """Main function to start the strategy"""
     try:
         logging.info("Starting Open Interest Option Buying Strategy...")
+        
+        # Check if we're past 9:20 AM IST and prompt if needed
+        if check_past_nine_twenty():
+            logging.info("Current time is past 9:20 AM IST")
+            if prompt_for_immediate_run():
+                logging.info("User chose to bypass 9:20 AM check - running immediately")
+                return run_strategy_now()
+            logging.info("User chose to proceed with normal strategy execution")
         
         # Ensure we have a valid access token before starting
         logging.info("Checking authentication status...")

@@ -16,6 +16,8 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
     backoff = min_delay
     heartbeat_interval = 30
     last_ping_time = [time.time()]
+    # Track symbols we've already logged to reduce duplicate logs
+    logged_symbols = set()
 
     expected_columns = [
         'ltp', 'vol_traded_today', 'last_traded_time', 'exch_feed_time',
@@ -46,10 +48,29 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
             if callback_handler:
                 callback_handler(symbol, 'tick', ticks, ticks)
             if 'ltp' in ticks:
-                if is_option:
-                    logging.info(f"WebSocket option tick: {symbol} LTP: {ticks['ltp']}")
-                else:
-                    logging.info(f"WebSocket tick: {symbol} LTP: {ticks['ltp']}")
+                if symbol not in logged_symbols:
+                    if is_option:
+                        logging.info(f"WebSocket option tick: {symbol} LTP: {ticks['ltp']}")
+                    else:
+                        logging.info(f"WebSocket tick: {symbol} LTP: {ticks['ltp']}")
+                    logged_symbols.add(symbol)
+                    
+                # Always update a running ticker count to verify WS is active
+                if not hasattr(market_data_df, 'tick_count'):
+                    market_data_df.tick_count = 0
+                market_data_df.tick_count += 1
+                
+                # Log an active heartbeat every 50 ticks
+                if market_data_df.tick_count % 50 == 0:
+                    logging.info(f"WebSocket active: {market_data_df.tick_count} ticks received")
+                    
+            # Clear the logged symbols set every 2 minutes to allow fresh logs
+            now = time.time()
+            if not hasattr(market_data_df, 'last_symbol_clear'):
+                market_data_df.last_symbol_clear = now
+            if now - market_data_df.last_symbol_clear > 120:  # 2 minutes
+                logged_symbols.clear()
+                market_data_df.last_symbol_clear = now
 
     def on_error(error):
         logging.error(f"WebSocket error: {error}")
@@ -67,10 +88,10 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
         if callable(on_failure):
             on_failure(error_code, message)
 
-    def on_open():
+    def on_open(client):
         logging.info(f"WebSocket connection opened for {len(symbols)} symbols")
         try:
-            ws_client.subscribe(symbols=symbols, data_type=data_type)
+            client.subscribe(symbols=symbols, data_type=data_type)
             logging.info(f"Subscription requested for symbols: {symbols}")
             if callable(on_success):
                 on_success({"status": "Subscription requested", "symbols": symbols})
@@ -86,7 +107,7 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
                 try:
                     if hasattr(ws_client, 'ping'):
                         ws_client.ping()
-                        logging.info("WebSocket ping sent.")
+                        logging.debug("WebSocket ping sent.")  # Reduced to debug level
                     last_ping_time[0] = now
                 except Exception as e:
                     logging.warning(f"WebSocket ping failed: {e}")
@@ -96,31 +117,34 @@ def robust_market_data_websocket(symbols, callback_handler=None, data_type="Symb
         nonlocal backoff
         while True:
             try:
-                ws_client = data_ws.FyersDataSocket(
+                # Create WebSocket client
+                local_client = data_ws.FyersDataSocket(
                     access_token=f"{client_id}:{access_token}",
                     log_path="logs/",
                     litemode=False,
                     write_to_file=False,
                     reconnect=False,  # We'll handle reconnection
-                    on_connect=on_open,
                     on_close=on_close,
                     on_error=on_error,
                     on_message=on_message
                 )
-                ws_client.connect()
-                ws_client.market_data = market_data_df
-                ws_client.tick_queue = tick_queue
-                if not hasattr(ws_client, 'close_connection'):
+                
+                # Set the on_connect callback with a closure that has access to the client
+                local_client.on_connect = lambda: on_open(local_client)
+                local_client.connect()
+                local_client.market_data = market_data_df
+                local_client.tick_queue = tick_queue
+                if not hasattr(local_client, 'close_connection'):
                     def close_connection():
                         try:
                             logging.info("Closing websocket connection...")
-                            ws_client.terminate()
+                            local_client.terminate()
                             logging.info("Websocket connection terminated")
                         except Exception as e:
                             logging.error(f"Error terminating websocket: {str(e)}")
-                    ws_client.close_connection = close_connection
-                threading.Thread(target=heartbeat_thread, args=(ws_client,), daemon=True).start()
-                return ws_client
+                    local_client.close_connection = close_connection
+                threading.Thread(target=heartbeat_thread, args=(local_client,), daemon=True).start()
+                return local_client
             except Exception as e:
                 logging.error(f"WebSocket connection failed: {e}. Retrying in {backoff}s...")
                 time.sleep(backoff)
@@ -164,7 +188,7 @@ def get_fyers_client(check_token=True):
         # Test connection with profile API
         profile_response = fyers.get_profile()
         if profile_response.get('s') == 'ok':
-            logging.info(f"Successfully authenticated with Fyers API for user: {profile_response.get('data', {}).get('name')}")
+            logging.debug(f"Successfully authenticated with Fyers API for user: {profile_response.get('data', {}).get('name')}")
             return fyers
         else:
             logging.error(f"Fyers authentication failed: {profile_response}")
@@ -536,7 +560,7 @@ def get_ltp(fyers, symbol, websocket_client=None):
             if data and len(data) > 0 and 'v' in data[0]:
                 # Extract the last price from the response
                 ltp = data[0]['v'].get('lp', 0)
-                logging.info(f"LTP from API for {symbol}: {ltp}")
+                logging.debug(f"LTP from API for {symbol}: {ltp}")
                 return float(ltp)
                 
         logging.warning(f"Failed to get LTP for {symbol}: {quotes_response}")
