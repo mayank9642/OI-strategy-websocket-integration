@@ -45,6 +45,9 @@ class OpenInterestStrategy:
         self.data_socket = None
         self.trade_history = []
         self.trade_taken_today = False  # Flag to track if a trade has been taken today
+        # Ensure breakout levels are always defined
+        self.put_breakout_level = None
+        self.call_breakout_level = None
         
         # Paper trading mode (simulate trades without placing actual orders)
         self.paper_trading = self.config.get('strategy', {}).get('paper_trading', True)
@@ -67,10 +70,48 @@ class OpenInterestStrategy:
         except Exception as e:
             logging.warning(f"Could not load trade history: {str(e)}")
         
+    def reset_state(self):
+        """Reset all state variables for a clean start"""
+        # OI analysis results
+        self.highest_put_oi_strike = None
+        self.highest_call_oi_strike = None
+        self.put_premium_at_9_20 = None
+        self.call_premium_at_9_20 = None
+        self.highest_put_oi_symbol = None
+        self.highest_call_oi_symbol = None
+        self.put_breakout_level = None
+        self.call_breakout_level = None
+        
+        # Initialize trade state variables
+        self.active_trade = None
+        self.entry_time = None
+        self.order_id = None
+        self.stop_loss_order_id = None
+        self.target_order_id = None
+        self.trade_taken_today = False
+        
+        # Storage for live price updates
+        self.live_prices = {}
+        
+        # Close existing WebSocket connection if any
+        if hasattr(self, 'data_socket') and self.data_socket:
+            try:
+                self.data_socket.close()
+                logging.info("Closed existing WebSocket connection")
+            except Exception as e:
+                logging.warning(f"Error closing WebSocket: {str(e)}")
+        self.data_socket = None
+
     def initialize_day(self):
         """Reset variables for a new trading day"""
         # Check for valid token before starting the trading day
         try:
+            # Clear the logs for a fresh start
+            self.clear_logs()
+            
+            # Reset all state variables for a clean start
+            self.reset_state()
+            
             access_token = ensure_valid_token()
             if access_token:
                 self.fyers = get_fyers_client(check_token=False)  # Token already checked
@@ -90,20 +131,7 @@ class OpenInterestStrategy:
             self.data_socket = None
             
             # Reset trading variables
-            self.active_trade = None
-            self.highest_put_oi_strike = None
-            self.highest_call_oi_strike = None
-            self.put_premium_at_9_20 = None
-            self.call_premium_at_9_20 = None
-            self.entry_time = None
-            self.order_id = None
-            self.stop_loss_order_id = None
-            self.target_order_id = None
-            self.trade_taken_today = False  # Reset the daily trade flag
-            
-            # Dictionary to track live price data from websocket
-            self.live_prices = {}
-            self.trade_history = []
+            self.reset_state()
             
             logging.info("Strategy initialized for a new trading day")
             return True
@@ -115,136 +143,211 @@ class OpenInterestStrategy:
     def identify_high_oi_strikes(self):
         """Identify strikes with highest open interest at 9:20 AM"""
         try:
+            # Reset breakout levels for a fresh start
+            self.put_breakout_level = None
+            self.call_breakout_level = None
+            
             # Check if markets are open today
             today = datetime.datetime.now()
             if today.weekday() > 4:  # Saturday or Sunday
                 logging.warning("Markets are closed today (weekend). Skipping analysis.")
                 return False
-                
-            # Get the Nifty option chain
-            logging.info("Fetching option chain data for analysis...")
-            option_chain = get_nifty_option_chain()
             
-            if option_chain is None or option_chain.empty:
-                logging.error("Failed to fetch option chain data")
-                return False
-                
-            # Get current Nifty spot price
-            spot_price = option_chain['spot_price'].iloc[0]
+            # Get the current Nifty spot price
+            from src.fyers_api_utils import get_nifty_spot_price
+            spot_price = get_nifty_spot_price()
             logging.info(f"Current Nifty spot price: {spot_price}")
             
-            # Find suitable strikes
-            return self._find_suitable_strikes(0, spot_price)
+            # Find suitable strikes starting with the current expiry
+            logging.info("Starting OI analysis to find suitable strikes...")
+            result = self._find_suitable_strikes(0, spot_price)
+            
+            # Verify that breakout levels are properly set
+            if result is False or self.put_breakout_level is None or self.call_breakout_level is None:
+                logging.error("OI analysis failed or breakout levels not set. Aborting strategy for today.")
+                # Clear any partially set data to avoid confusion
+                self.highest_put_oi_strike = None
+                self.highest_call_oi_strike = None
+                self.put_premium_at_9_20 = None
+                self.call_premium_at_9_20 = None
+                self.highest_put_oi_symbol = None
+                self.highest_call_oi_symbol = None
+                self.put_breakout_level = None
+                self.call_breakout_level = None
+                return False
+            
+            # Final validation of the selected strikes and their premiums
+            logging.info("OI analysis completed successfully")
+            logging.info(f"Selected strikes - PUT: {self.highest_put_oi_strike} (Premium: {self.put_premium_at_9_20}, Breakout: {self.put_breakout_level})")
+            logging.info(f"Selected strikes - CALL: {self.highest_call_oi_strike} (Premium: {self.call_premium_at_9_20}, Breakout: {self.call_breakout_level})")
+            return result
+            
         except Exception as e:
             logging.error(f"Error identifying high OI strikes: {str(e)}")
+            import traceback
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Clear any partially set data
+            self.highest_put_oi_strike = None
+            self.highest_call_oi_strike = None
+            self.put_premium_at_9_20 = None
+            self.call_premium_at_9_20 = None
+            self.highest_put_oi_symbol = None
+            self.highest_call_oi_symbol = None
+            self.put_breakout_level = None
+            self.call_breakout_level = None
             return False
 
     def _find_suitable_strikes(self, expiry_index=0, spot_price=None):
         """Find suitable strikes for the given expiry index"""
         try:
+            logging.info(f"Fetching option chain data for expiry index {expiry_index}...")
             option_chain = get_nifty_option_chain(expiry_index)
             
             if option_chain is None or option_chain.empty:
                 logging.error(f"Failed to fetch option chain for expiry index {expiry_index}")
+                if expiry_index < 2:  # Try next expiry if available
+                    logging.info(f"Trying next expiry (index {expiry_index + 1})...")
+                    return self._find_suitable_strikes(expiry_index + 1, spot_price)
                 return False
                 
             if spot_price is None:
-                spot_price = option_chain['spot_price'].iloc[0]
+                if 'strike_price' in option_chain.columns:
+                    spot_price = option_chain['strike_price'].median()
+                    logging.info(f"Using median strike_price as spot: {spot_price}")
+                elif 'ltp' in option_chain.columns:
+                    spot_price = option_chain['ltp'].median()
+                    logging.info(f"Using median ltp as spot: {spot_price}")
+                else:
+                    from src.fyers_api_utils import get_nifty_spot_price
+                    spot_price = get_nifty_spot_price()
+                    logging.info(f"Fetched spot price from API: {spot_price}")
             
             # Identify ATM strike (closest to spot price)
             atm_strike = round(spot_price / 100) * 100
             
             # Filter by distance from ATM
             max_distance = self.max_strike_distance  # Max distance from ATM
-            filtered_chain = option_chain[(option_chain['strikePrice'] >= atm_strike - max_distance) & 
-                                         (option_chain['strikePrice'] <= atm_strike + max_distance)]
+            logging.info(f"Filtering options within {max_distance} points of ATM strike {atm_strike}")
             
-            if filtered_chain.empty:
-                logging.warning(f"No options found within {max_distance} points of ATM. Using full chain.")
+            try:
+                filtered_chain = option_chain[(option_chain['strikePrice'] >= atm_strike - max_distance) & 
+                                             (option_chain['strikePrice'] <= atm_strike + max_distance)]
+                
+                if filtered_chain.empty:
+                    logging.warning(f"No options found within {max_distance} points of ATM. Using full chain.")
+                    filtered_chain = option_chain
+            except Exception as e:
+                logging.error(f"Error filtering option chain: {str(e)}")
+                logging.info("Using full option chain without filtering")
                 filtered_chain = option_chain
             
             # Find strike with highest put OI
             put_chain = filtered_chain[filtered_chain['option_type'] == 'PE']
             if not put_chain.empty:
                 put_oi_sorted = put_chain.sort_values('openInterest', ascending=False)
+                logging.info(f"Top 3 PUT OI strikes: {put_oi_sorted[['strikePrice', 'openInterest', 'lastPrice']].head(3).to_dict('records')}")
                 
-                # Get the highest OI PUT strike
                 self.highest_put_oi_strike = int(put_oi_sorted['strikePrice'].iloc[0])
+                put_premium_row = put_oi_sorted[put_oi_sorted['strikePrice'] == self.highest_put_oi_strike]
                 
-                # Get PUT premium
-                self.put_premium_at_9_20 = float(put_oi_sorted[put_oi_sorted['strikePrice'] == self.highest_put_oi_strike]['lastPrice'].iloc[0])
-                
-                # Get symbol
-                self.highest_put_oi_symbol = put_oi_sorted[put_oi_sorted['strikePrice'] == self.highest_put_oi_strike]['symbol'].iloc[0]
-                
-                # Log important information only
+                if put_premium_row.empty:
+                    logging.error(f"No row found for highest PUT OI strike {self.highest_put_oi_strike}. DataFrame: {put_oi_sorted}")
+                    if expiry_index < 2:
+                        return self._find_suitable_strikes(expiry_index + 1, spot_price)
+                    return False
+                    
+                if 'lastPrice' not in put_premium_row.columns:
+                    logging.error(f"'lastPrice' column missing for highest PUT OI strike {self.highest_put_oi_strike}. Columns: {put_premium_row.columns.tolist()}")
+                    logging.error(f"Row data: {put_premium_row}")
+                    if expiry_index < 2:
+                        return self._find_suitable_strikes(expiry_index + 1, spot_price)
+                    return False
+                    
+                self.put_premium_at_9_20 = float(put_premium_row['lastPrice'].iloc[0])
+                self.highest_put_oi_symbol = put_premium_row['symbol'].iloc[0]
                 logging.info(f"Highest PUT OI Strike: {self.highest_put_oi_strike}, Premium: {self.put_premium_at_9_20}, Symbol: {self.highest_put_oi_symbol}")
             else:
                 logging.error("No PUT options found in filtered chain")
+                if expiry_index < 2:
+                    return self._find_suitable_strikes(expiry_index + 1, spot_price)
                 return False
-            
+                
             # Find strike with highest call OI
             call_chain = filtered_chain[filtered_chain['option_type'] == 'CE']
             if not call_chain.empty:
                 call_oi_sorted = call_chain.sort_values('openInterest', ascending=False)
+                logging.info(f"Top 3 CALL OI strikes: {call_oi_sorted[['strikePrice', 'openInterest', 'lastPrice']].head(3).to_dict('records')}")
                 
-                # Get the highest OI CALL strike
                 self.highest_call_oi_strike = int(call_oi_sorted['strikePrice'].iloc[0])
+                call_premium_row = call_oi_sorted[call_oi_sorted['strikePrice'] == self.highest_call_oi_strike]
                 
-                # Get CALL premium
-                self.call_premium_at_9_20 = float(call_oi_sorted[call_oi_sorted['strikePrice'] == self.highest_call_oi_strike]['lastPrice'].iloc[0])
-                
-                # Get symbol
-                self.highest_call_oi_symbol = call_oi_sorted[call_oi_sorted['strikePrice'] == self.highest_call_oi_strike]['symbol'].iloc[0]
-                
-                # Log important information only
+                if call_premium_row.empty:
+                    logging.error(f"No row found for highest CALL OI strike {self.highest_call_oi_strike}. DataFrame: {call_oi_sorted}")
+                    if expiry_index < 2:
+                        return self._find_suitable_strikes(expiry_index + 1, spot_price)
+                    return False
+                    
+                if 'lastPrice' not in call_premium_row.columns:
+                    logging.error(f"'lastPrice' column missing for highest CALL OI strike {self.highest_call_oi_strike}. Columns: {call_premium_row.columns.tolist()}")
+                    logging.error(f"Row data: {call_premium_row}")
+                    if expiry_index < 2:
+                        return self._find_suitable_strikes(expiry_index + 1, spot_price)
+                    return False
+                    
+                self.call_premium_at_9_20 = float(call_premium_row['lastPrice'].iloc[0])
+                self.highest_call_oi_symbol = call_premium_row['symbol'].iloc[0]
                 logging.info(f"Highest CALL OI Strike: {self.highest_call_oi_strike}, Premium: {self.call_premium_at_9_20}, Symbol: {self.highest_call_oi_symbol}")
                 logging.info(f"Highest CE OI details: {{'strikePrice': {self.highest_call_oi_strike}, 'symbol': '{self.highest_call_oi_symbol}', 'lastPrice': {self.call_premium_at_9_20}, 'openInterest': {int(call_oi_sorted['openInterest'].iloc[0])}}}")
             else:
                 logging.error("No CALL options found in filtered chain")
+                if expiry_index < 2:
+                    return self._find_suitable_strikes(expiry_index + 1, spot_price)
                 return False
                 
             # Check if premiums are too low (filter out options with very low premiums)
-            next_expiry_tried = False
+            premium_threshold_met = True
+            
             if (self.put_premium_at_9_20 < self.min_premium_threshold or 
                 self.call_premium_at_9_20 < self.min_premium_threshold):
-                logging.info("First highest OI strikes have premiums below threshold, checking 2nd highest OI strikes...")
+                logging.info(f"First highest OI strikes have premiums below threshold ({self.min_premium_threshold}), checking 2nd highest OI strikes...")
+                premium_threshold_met = False
                 self._find_second_highest_oi_strikes(option_chain, spot_price)
             
-            # If premiums are still below threshold, try next expiry
+            # If premiums are still below threshold after checking 2nd highest OI, try next expiry
             if (self.put_premium_at_9_20 < self.min_premium_threshold or 
                 self.call_premium_at_9_20 < self.min_premium_threshold):
-                logging.info("Both 1st and 2nd highest OI strikes have premiums below threshold, checking next expiry...")
-                next_expiry_index = 1  # Next expiry
-                next_expiry_tried = True
-                option_chain = self._find_suitable_strikes(next_expiry_index, spot_price)
-                
-                # Try 2nd highest OI in next expiry if needed
-                if (self.put_premium_at_9_20 < self.min_premium_threshold or 
-                    self.call_premium_at_9_20 < self.min_premium_threshold):
-                    logging.info("Next expiry's highest OI strikes have premiums below threshold, checking 2nd highest OI strikes in next expiry...")
-                    self._find_second_highest_oi_strikes(option_chain, spot_price)
+                if expiry_index < 2:  # Limit to next 2 expiries
+                    logging.info(f"Both 1st and 2nd highest OI strikes have premiums below threshold ({self.min_premium_threshold}), checking next expiry...")
+                    next_expiry_index = expiry_index + 1
+                    # Return the result of the next expiry call directly, do not continue in parent
+                    return self._find_suitable_strikes(next_expiry_index, spot_price)
+                else:
+                    logging.warning(f"Reached maximum expiry index {expiry_index}. Using best available premiums despite being below threshold.")
+                    premium_threshold_met = True  # Force continue with what we have
             
-            logging.info(f"Final PUT selection - Strike: {self.highest_put_oi_strike}, Premium: {self.put_premium_at_9_20}")
-            logging.info(f"Strike distance from spot: {abs(self.highest_put_oi_strike - spot_price)} points")
-            if next_expiry_tried:
-                logging.info("Using next expiry for PUT option")
+            # Only set breakout levels if valid premiums are found and not returning early
+            if premium_threshold_met or expiry_index >= 2:
+                logging.info(f"Final PUT selection - Strike: {self.highest_put_oi_strike}, Premium: {self.put_premium_at_9_20}")
+                logging.info(f"Strike distance from spot: {abs(self.highest_put_oi_strike - spot_price)} points")
+                logging.info(f"Final CALL selection - Strike: {self.highest_call_oi_strike}, Premium: {self.call_premium_at_9_20}")
+                logging.info(f"Strike distance from spot: {abs(self.highest_call_oi_strike - spot_price)} points")
                 
-            logging.info(f"Final CALL selection - Strike: {self.highest_call_oi_strike}, Premium: {self.call_premium_at_9_20}")
-            logging.info(f"Strike distance from spot: {abs(self.highest_call_oi_strike - spot_price)} points")
-            if next_expiry_tried:
-                logging.info("Using next expiry for CALL option")
+                # Calculate breakout levels (10% increase)
+                self.put_breakout_level = round(self.put_premium_at_9_20 * 1.10, 1)
+                self.call_breakout_level = round(self.call_premium_at_9_20 * 1.10, 1)
+                logging.info(f"PUT Breakout Level: {self.put_breakout_level}")
+                logging.info(f"CALL Breakout Level: {self.call_breakout_level}")
+                return option_chain
                 
-            # Calculate breakout levels (10% increase)
-            self.put_breakout_level = round(self.put_premium_at_9_20 * 1.10, 1)
-            self.call_breakout_level = round(self.call_premium_at_9_20 * 1.10, 1)
+            return option_chain  # Should not reach here as we either return from recursive call or set breakout levels
             
-            logging.info(f"PUT Breakout Level: {self.put_breakout_level}")
-            logging.info(f"CALL Breakout Level: {self.call_breakout_level}")
-            
-            return option_chain
         except Exception as e:
             logging.error(f"Error finding suitable strikes: {str(e)}")
+            import traceback
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            if expiry_index < 2:  # Try next expiry if we have one
+                return self._find_suitable_strikes(expiry_index + 1, spot_price)
             return False
             
     def _start_tick_queue_consumer(self):
@@ -286,6 +389,13 @@ class OpenInterestStrategy:
     def monitor_for_breakout(self):
         """Continuously monitor option premiums for breakout using websocket for real-time data"""
         try:
+            # Ensure breakout levels are set
+            if self.put_breakout_level is None or self.call_breakout_level is None:
+                logging.error("Breakout levels are not set. OI analysis may have failed. Aborting breakout monitoring.")
+                logging.error(f"PUT breakout level: {self.put_breakout_level}, CALL breakout level: {self.call_breakout_level}")
+                logging.error(f"PUT premium: {self.put_premium_at_9_20}, CALL premium: {self.call_premium_at_9_20}")
+                logging.error(f"PUT strike: {self.highest_put_oi_strike}, CALL strike: {self.highest_call_oi_strike}")
+                return
             # Set up websocket for put and call strikes if not already established
             if not self.data_socket:
                 put_symbol = self.highest_put_oi_symbol
@@ -300,7 +410,6 @@ class OpenInterestStrategy:
                 self.data_socket = start_market_data_websocket(symbols=symbols_to_monitor, callback_handler=ws_breakout_handler)
                 logging.info("WebSocket connection established for breakout monitoring")
                 self._start_tick_queue_consumer()
-            
             # Also poll for breakouts as a fallback in case websocket fails
             def monitor_loop():
                 while not self.active_trade:
@@ -308,38 +417,29 @@ class OpenInterestStrategy:
                         # Try to get prices from websocket first
                         put_symbol = self.highest_put_oi_symbol
                         call_symbol = self.highest_call_oi_symbol
-                        
                         current_put_premium = None
                         current_call_premium = None
-                        
                         # Try websocket first
                         if put_symbol in self.live_prices:
                             current_put_premium = self.live_prices[put_symbol]
-                        
                         if call_symbol in self.live_prices:
                             current_call_premium = self.live_prices[call_symbol]
-                        
                         # Fallback to API if needed
                         if current_put_premium is None or current_call_premium is None:
                             option_chain = get_nifty_option_chain()
-                            
                             if current_put_premium is None:
                                 current_put_premium = option_chain[(option_chain['strikePrice'] == self.highest_put_oi_strike) & 
                                                          (option_chain['option_type'] == 'PE')]['lastPrice'].values[0]
-                                
                             if current_call_premium is None:
                                 current_call_premium = option_chain[(option_chain['strikePrice'] == self.highest_call_oi_strike) & 
                                                           (option_chain['option_type'] == 'CE')]['lastPrice'].values[0]
-                        
                         # Log current premiums
                         data_source_put = "WS" if put_symbol in self.live_prices else "API"
                         data_source_call = "WS" if call_symbol in self.live_prices else "API"
-                        
                         logging.info(f"Current PUT premium: {current_put_premium} [{data_source_put}], Breakout level: {self.put_breakout_level}")
                         logging.info(f"Current CALL premium: {current_call_premium} [{data_source_call}], Breakout level: {self.call_breakout_level}")
-                        
                         # Check for PUT breakout with minimum premium threshold
-                        if (current_put_premium >= self.put_breakout_level and 
+                        if (self.put_breakout_level is not None and current_put_premium >= self.put_breakout_level and 
                             current_put_premium >= self.min_premium_threshold):
                             self.entry_time = self.get_ist_datetime()
                             symbol = self.highest_put_oi_symbol
@@ -347,7 +447,7 @@ class OpenInterestStrategy:
                             self.execute_trade(symbol, "BUY", current_put_premium)
                             break
                         # Check for CALL breakout with minimum premium threshold
-                        if (current_call_premium >= self.call_breakout_level and 
+                        if (self.call_breakout_level is not None and current_call_premium >= self.call_breakout_level and 
                             current_call_premium >= self.min_premium_threshold):
                             self.entry_time = self.get_ist_datetime()
                             symbol = self.highest_call_oi_symbol
@@ -1327,10 +1427,13 @@ class OpenInterestStrategy:
                 current_time.hour == analysis_time.hour and 
                 current_time.minute >= analysis_time.minute and 
                 current_time.minute < analysis_time.minute + 1):
-                
                 logging.info("Performing OI analysis (manual trigger or scheduled)...")
-                self.identify_high_oi_strikes()
-                
+                oi_result = self.identify_high_oi_strikes()
+                logging.info(f"After OI analysis: put_breakout_level={self.put_breakout_level}, call_breakout_level={self.call_breakout_level}")
+                if oi_result is False:
+                    logging.error("OI analysis or breakout level calculation failed. Exiting strategy run.")
+                    return
+                logging.info(f"Breakout levels for monitoring: put={self.put_breakout_level}, call={self.call_breakout_level}")
             # Step 2: After 9:20, monitor for breakouts only if no trade has been taken today
             if self.highest_put_oi_strike and self.highest_call_oi_strike:
                 if not self.active_trade and not self.trade_taken_today:
@@ -1452,87 +1555,7 @@ class OpenInterestStrategy:
         except Exception as e:
             logging.error(f"Error during cleanup: {str(e)}")
     
-    def _find_suitable_strikes(self, expiry_index, spot_price):
-        """
-        Find suitable strikes in the specified expiry
-        
-        Args:
-            expiry_index: Index of expiry to use (0=current, 1=next)
-            spot_price: Current spot price of Nifty
-            
-        Returns:
-            DataFrame: The option chain data used
-        """
-        # Get Nifty option chain data for specified expiry
-        logging.info(f"Fetching option chain data for expiry index {expiry_index}...")
-        option_chain = get_nifty_option_chain(expiry_index)
-        
-        if option_chain.empty:
-            logging.error(f"Empty option chain returned for expiry index {expiry_index}")
-            return pd.DataFrame()
-        
-        # Find the put strike with highest OI
-        put_data = option_chain[option_chain['option_type'] == 'PE']
-        if put_data.empty:
-            logging.error("No put options found in option chain")
-            return option_chain
-        
-        # Check if spot_price is provided, otherwise try to extract it from option chain
-        if spot_price is None:
-            try:
-                # Try to get spot_price from option_chain if it exists
-                if 'spot_price' in option_chain.columns and not option_chain['spot_price'].isnull().all():
-                    spot_price = option_chain['spot_price'].iloc[0]
-                elif 'underlyingValue' in option_chain.columns and not option_chain['underlyingValue'].isnull().all():
-                    spot_price = option_chain['underlyingValue'].iloc[0]
-                else:
-                    # Fallback to getting spot price again
-                    from src.fyers_api_utils import get_nifty_spot_price
-                    spot_price = get_nifty_spot_price()
-                logging.info(f"Using spot price: {spot_price} for strike selection")
-            except Exception as e:
-                logging.error(f"Failed to determine spot price: {e}")
-                # Don't return yet, try one more method
-                try:
-                    from src.fyers_api_utils import get_nifty_spot_price
-                    spot_price = get_nifty_spot_price()
-                    if spot_price and spot_price > 0:
-                        logging.info(f"Retrieved spot price directly: {spot_price}")
-                    else:
-                        logging.error("Failed to get valid spot price, cannot filter strikes")
-                        return option_chain
-                except Exception as e2:
-                    logging.error(f"Final attempt to get spot price failed: {e2}")
-                    return option_chain
-        
-        # Filter by max strike distance - keep this to avoid extremely far OTM strikes
-        put_data = put_data[abs(put_data['strikePrice'] - spot_price) <= self.max_strike_distance]
-        
-        if not put_data.empty:
-            # Get the strike with highest OI (focus on OI first, worry about premium later)
-            self.highest_put_oi_strike = put_data.loc[put_data['openInterest'].idxmax()]['strikePrice']
-            self.put_premium_at_9_20 = put_data[put_data['strikePrice'] == self.highest_put_oi_strike]['lastPrice'].values[0]
-            self.highest_put_oi_symbol = put_data[put_data['strikePrice'] == self.highest_put_oi_strike]['symbol'].values[0]
-        
-        # Find the call strike with highest OI
-        call_data = option_chain[option_chain['option_type'] == 'CE']
-        if call_data.empty:
-            logging.error("No call options found in option chain")
-            return option_chain
-        
-        # Filter by max strike distance - keep this to avoid extremely far OTM strikes
-        call_data = call_data[abs(call_data['strikePrice'] - spot_price) <= self.max_strike_distance]
-        
-        if not call_data.empty:
-            # Get the strike with highest OI (focus on OI first, worry about premium later)
-            self.highest_call_oi_strike = call_data.loc[call_data['openInterest'].idxmax()]['strikePrice']
-            self.call_premium_at_9_20 = call_data[call_data['strikePrice'] == self.highest_call_oi_strike]['lastPrice'].values[0]
-            self.highest_call_oi_symbol = call_data[call_data['strikePrice'] == self.highest_call_oi_strike]['symbol'].values[0]
-        
-        logging.info(f"Expiry {expiry_index} - PUT Strike: {self.highest_put_oi_strike}, Premium: {self.put_premium_at_9_20}")
-        logging.info(f"Expiry {expiry_index} - CALL Strike: {self.highest_call_oi_strike}, Premium: {self.call_premium_at_9_20}")
-        
-        return option_chain
+    # No duplicate method here - using the implementation at the top of the file
     
     def _find_second_highest_oi_strikes(self, option_chain, spot_price):
         """
@@ -1552,54 +1575,68 @@ class OpenInterestStrategy:
         # Process PUT options
         put_data = option_chain[option_chain['option_type'] == 'PE']
         if not put_data.empty:
-            # Filter by max distance
-            put_data = put_data[abs(put_data['strikePrice'] - spot_price) <= self.max_strike_distance]
-            
-            if self.put_premium_at_9_20 < self.min_premium_threshold and len(put_data) > 1:
-                # Sort by openInterest descending
-                sorted_puts = put_data.sort_values('openInterest', ascending=False)
+            try:
+                # Filter by max distance
+                put_data = put_data[abs(put_data['strikePrice'] - spot_price) <= self.max_strike_distance]
                 
-                # Skip the 1st highest OI strike (which we already checked) and get the 2nd highest
-                if len(sorted_puts) >= 2:
-                    second_highest_put = sorted_puts.iloc[1]
-                    strike = second_highest_put['strikePrice']
-                    premium = second_highest_put['lastPrice']
-                    symbol = second_highest_put['symbol']
+                if self.put_premium_at_9_20 < self.min_premium_threshold and len(put_data) > 1:
+                    # Sort by openInterest descending
+                    sorted_puts = put_data.sort_values('openInterest', ascending=False)
                     
-                    logging.info(f"2nd highest PUT OI - Strike: {strike}, Premium: {premium}")
+                    # Look through top 5 highest OI strikes for better premiums
+                    num_strikes_to_check = min(5, len(sorted_puts))
+                    logging.info(f"Checking top {num_strikes_to_check} PUT strikes by OI for acceptable premiums")
                     
-                    # Only update if the premium is better than current
-                    if premium >= self.min_premium_threshold or premium > self.put_premium_at_9_20:
-                        self.highest_put_oi_strike = strike
-                        self.put_premium_at_9_20 = premium
-                        self.highest_put_oi_symbol = symbol
-                        logging.info(f"Updated to 2nd highest PUT OI because of better premium")
+                    for i in range(1, num_strikes_to_check):  # Start from second highest (index 1)
+                        alt_put_strike = sorted_puts.iloc[i]
+                        strike = alt_put_strike['strikePrice']
+                        premium = alt_put_strike['lastPrice']
+                        symbol = alt_put_strike['symbol']
+                        
+                        logging.info(f"Alternative PUT OI #{i+1} - Strike: {strike}, Premium: {premium}, OI: {alt_put_strike['openInterest']}")
+                        
+                        # Update if premium meets threshold or is better than current
+                        if premium >= self.min_premium_threshold or premium > self.put_premium_at_9_20:
+                            self.highest_put_oi_strike = strike
+                            self.put_premium_at_9_20 = premium
+                            self.highest_put_oi_symbol = symbol
+                            logging.info(f"Updated to alternative PUT strike {strike} because of better premium ({premium})")
+                            break  # Found a suitable alternative
+            except Exception as e:
+                logging.error(f"Error finding alternative PUT strikes: {str(e)}")
         
         # Process CALL options
         call_data = option_chain[option_chain['option_type'] == 'CE']
         if not call_data.empty:
-            # Filter by max distance
-            call_data = call_data[abs(call_data['strikePrice'] - spot_price) <= self.max_strike_distance]
-            
-            if self.call_premium_at_9_20 < self.min_premium_threshold and len(call_data) > 1:
-                # Sort by openInterest descending
-                sorted_calls = call_data.sort_values('openInterest', ascending=False)
+            try:
+                # Filter by max distance
+                call_data = call_data[abs(call_data['strikePrice'] - spot_price) <= self.max_strike_distance]
                 
-                # Skip the 1st highest OI strike (which we already checked) and get the 2nd highest
-                if len(sorted_calls) >= 2:
-                    second_highest_call = sorted_calls.iloc[1]
-                    strike = second_highest_call['strikePrice']
-                    premium = second_highest_call['lastPrice']
-                    symbol = second_highest_call['symbol']
+                if self.call_premium_at_9_20 < self.min_premium_threshold and len(call_data) > 1:
+                    # Sort by openInterest descending
+                    sorted_calls = call_data.sort_values('openInterest', ascending=False)
                     
-                    logging.info(f"2nd highest CALL OI - Strike: {strike}, Premium: {premium}")
+                    # Look through top 5 highest OI strikes for better premiums
+                    num_strikes_to_check = min(5, len(sorted_calls))
+                    logging.info(f"Checking top {num_strikes_to_check} CALL strikes by OI for acceptable premiums")
                     
-                    # Only update if the premium is better than current
-                    if premium >= self.min_premium_threshold or premium > self.call_premium_at_9_20:
-                        self.highest_call_oi_strike = strike
-                        self.call_premium_at_9_20 = premium
-                        self.highest_call_oi_symbol = symbol
-                        logging.info(f"Updated to 2nd highest CALL OI because of better premium")
+                    for i in range(1, num_strikes_to_check):  # Start from second highest (index 1)
+                        alt_call_strike = sorted_calls.iloc[i]
+                        strike = alt_call_strike['strikePrice']
+                        premium = alt_call_strike['lastPrice']
+                        symbol = alt_call_strike['symbol']
+                        
+                        logging.info(f"Alternative CALL OI #{i+1} - Strike: {strike}, Premium: {premium}, OI: {alt_call_strike['openInterest']}")
+                        
+                        # Update if premium meets threshold or is better than current
+                        if premium >= self.min_premium_threshold or premium > self.call_premium_at_9_20:
+                            self.highest_call_oi_strike = strike
+                            self.call_premium_at_9_20 = premium
+                            self.highest_call_oi_symbol = symbol
+                            logging.info(f"Updated to alternative CALL strike {strike} because of better premium ({premium})")
+                            break  # Found a suitable alternative
+            except Exception as e:
+                logging.error(f"Error finding alternative CALL strikes: {str(e)}")
             
     def get_fallback_option_price(self, symbol):
         """
@@ -1680,6 +1717,37 @@ class OpenInterestStrategy:
             
         except Exception as e:
             logging.error(f"Error recording trade performance: {str(e)}")
+            return False
+        
+    def clear_logs(self):
+        """Clear the strategy log file at the start of a new trading day"""
+        try:
+            log_path = 'logs/strategy.log'
+            if os.path.exists(log_path):
+                # Create a backup of the current log
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = f'logs/strategy_{timestamp}.log.bak'
+                
+                # Try to make a backup first
+                try:
+                    import shutil
+                    shutil.copy2(log_path, backup_path)
+                    logging.info(f"Created log backup at {backup_path}")
+                except Exception as e:
+                    logging.warning(f"Could not create log backup: {str(e)}")
+                
+                # Clear the current log file
+                with open(log_path, 'w') as f:
+                    f.write(f"Log file cleared on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    
+                logging.info("Log file has been cleared for new trading day")
+                return True
+            else:
+                logging.warning(f"Log file {log_path} not found, nothing to clear")
+                return False
+        except Exception as e:
+            logging.error(f"Error clearing log file: {str(e)}")
             return False
 
 
