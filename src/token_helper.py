@@ -46,19 +46,60 @@ def is_token_valid():
         logging.error(f"Error checking token validity: {str(e)}")
         return False
 
-def ensure_valid_token(use_totp=False):
+def ensure_valid_token(use_totp=False, max_retries=3):
     """
-    Check if token is valid, and if not, generate a new one.
+    Check if token is valid, and if not, generate a new one with exponential backoff retry.
     
     Args:
         use_totp (bool): Whether to use TOTP for authentication
+        max_retries (int): Maximum number of retry attempts
         
     Returns:
-        str: Valid access token
+        str: Valid access token or None if all attempts fail
     """
-    if is_token_valid():
-        config = load_config()
-        return config['fyers']['access_token']
-    else:
-        logging.info("Generating new access token...")
-        return generate_access_token(use_totp)
+    import time
+    retry_count = 0
+    retry_delay = 2  # Initial delay in seconds
+    
+    while retry_count < max_retries:
+        try:
+            # First check if we have a valid token
+            if is_token_valid():
+                config = load_config()
+                token = config['fyers']['access_token']
+                logging.info("Using existing valid access token")
+                return token
+            else:
+                # Token is missing or expired, generate a new one
+                logging.info(f"Generating new access token (attempt {retry_count + 1}/{max_retries})...")
+                token = generate_access_token(use_totp)
+                if token:
+                    # Verify the token actually works by making a simple API call
+                    from src.fyers_api_utils import get_fyers_client
+                    fyers = get_fyers_client(check_token=False)  # Use the new token
+                    if fyers:
+                        try:
+                            # Test with a simple API call
+                            profile = fyers.get_profile()
+                            if isinstance(profile, dict) and profile.get('s') == 'ok':
+                                logging.info("Successfully generated and verified new access token")
+                                return token
+                            else:
+                                logging.warning(f"Generated token verification failed: {profile}")
+                        except Exception as verify_error:
+                            logging.error(f"Error verifying new token: {str(verify_error)}")
+                    else:
+                        logging.info("Successfully generated new access token")
+                        return token
+        except Exception as e:
+            logging.error(f"Token error (attempt {retry_count + 1}/{max_retries}): {str(e)}")
+        
+        # Increment retry counter and delay before next attempt
+        retry_count += 1
+        if retry_count < max_retries:
+            logging.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+    
+    logging.critical("Failed to obtain valid token after multiple attempts. Please check your credentials and network connection.")
+    return None

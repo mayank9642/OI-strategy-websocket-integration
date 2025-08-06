@@ -36,6 +36,19 @@ cp config/config.yaml.example config/config.yaml
 # Edit config.yaml with your credentials
 ```
 
+## Directory Structure
+
+The project has been organized into the following structure:
+- `src/` - Core source code files
+- `tests/` - Test files
+- `logs/` - Log files
+- `docs/` - Documentation
+- `config/` - Configuration files
+- `archive/` - Archived old versions
+- `backups/` - Backup files
+
+See `DIRECTORY_STRUCTURE.md` for more details.
+
 ## Usage
 
 ### Authentication
@@ -52,14 +65,37 @@ Before running the strategy, you need to authenticate with Fyers:
 python src/auth.py
 ```
 
-### Run the Strategy
+### Run the Fixed Strategy
 ```bash
 # Windows
-python src\main.py
+.\run_fixed_strategy.bat
 
-# Linux/Mac
-python src/main.py
+# PowerShell
+.\run_fixed_strategy.ps1
+
+# Directly via Python
+python run_fixed_strategy.py
 ```
+
+### Wait for Market Open
+To run the strategy with automatic waiting for market open (instead of exiting):
+```bash
+# Windows
+.\wait_for_market_open.bat
+
+# PowerShell
+.\wait_for_market_open.ps1
+
+# Directly via Python
+python wait_and_run_strategy.py
+```
+
+The fixed strategy includes improvements:
+- Corrected option symbol formatting for Fyers API
+- Enhanced WebSocket implementation with better error handling
+- Fixed indentation issues in the codebase
+- Improved logging to both console and file
+- Ability to wait for market open instead of exiting
 
 ### View Dashboard
 The strategy includes a web-based dashboard for monitoring performance:

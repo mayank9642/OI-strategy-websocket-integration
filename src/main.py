@@ -25,6 +25,27 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+# Add a filter to remove sensitive information from logs
+class SensitiveInfoFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        
+        # Filter sensitive authentication info
+        if message.startswith("[DEBUG] get_fyers_client:"):
+            # Replace the message with a filtered version
+            record.msg = "[DEBUG] get_fyers_client: <CREDENTIALS FILTERED>"
+            return True
+            
+        # Filter repetitive option chain data structure logs
+        if "Sample option data structure:" in message:
+            # Drop this message entirely to reduce log size
+            return False
+            
+        return True
+
+# Apply filter to root logger
+logging.getLogger().addFilter(SensitiveInfoFilter())
+
 def job(strategy):
     """Run the strategy job at specified intervals"""
     try:

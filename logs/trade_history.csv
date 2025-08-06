@@ -1,3 +1,2 @@
-date,symbol,entry_time,entry_price,quantity,stoploss,target,paper_trade,exit_time,exit_price,exit_type,pnl,pnl_percent,duration_minutes
-2025-07-07,NSE:NIFTY2571025500CE,09:34:34,119.4,75,95.5,167.2,True,10:04:36,107.15,MAX_DURATION,-918.75,-10.259631490787273,30.03991245
-2025-07-08,NSE:NIFTY2571025500CE,12:34:00,84.6,75,67.7,118.4,True,13:04:03,79.55,MAX_DURATION,-378.75,-5.969267139479905,30.03624305
+Entry DateTime,Index,Symbol,Direction,Entry Price,Exit DateTime,Exit Price,Stop Loss,Target,Trailing SL,Quantity,Brokerage,P&L,Margin Required,% Gain/Loss,max up,max down,max up %,max down %
+2025-08-06 12:39:43,NIFTY,NSE:NIFTY2580724600PE,BUY,63.75,2025-08-06 12:40:15,71.28,51.0,89.2,71.28,75,13.39,551.36,4781.25,11.53,1128.75,,23.61,
