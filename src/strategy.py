@@ -17,6 +17,7 @@ import websocket
 from collections import defaultdict
 from src.fyers_api_utils import get_fyers_client
 from src.fixed_improved_websocket import enhanced_start_market_data_websocket
+from src.order_manager import OrderManager
 
 class OpenInterestStrategy:
     def __init__(self):
@@ -36,6 +37,10 @@ class OpenInterestStrategy:
         self.entry_time = None
         self.max_strike_distance = self.config.get('strategy', {}).get('max_strike_distance', 500)
         self.trade_history = []
+        self.order_manager = OrderManager(paper_trading=self.paper_trading)
+        self.gtt_ce_id = None
+        self.gtt_pe_id = None
+        self.gtt_active = False
         # Load today's trade history if file exists
         today = datetime.now().strftime('%Y%m%d')
         excel_path = f'logs/trade_history_{today}.xlsx'
@@ -198,7 +203,7 @@ class OpenInterestStrategy:
                 'max down': round(max_down, 2) if isinstance(max_down, (int, float)) else '',
                 'max up %': round(max_up_pct, 2) if isinstance(max_up_pct, (int, float)) else '',
                 'max down %': round(max_down_pct, 2) if isinstance(max_down_pct, (int, float)) else '',
-                'Brokerage': brokerage,
+                'Brokerage': round(brokerage, 2),  # This is the sum of all charges (brokerage + taxes + fees)
             })
         logging.info(f"Exiting trade: {symbol} | Reason: {exit_reason} | Exit Price: {exit_price}")
         logging.info(f"TRADE_EXIT | Symbol: {symbol} | Entry: {entry_price} | Exit: {exit_price} | Quantity: {quantity} | P&L: {net_pnl:.2f} ({(net_pnl / (entry_price * quantity)) * 100 if entry_price and quantity else 0:.2f}%) | MaxUP: {self.active_trade.get('max_up', 0):.2f} | MaxDN: {self.active_trade.get('max_down', 0):.2f} | Trailing SL: {self.active_trade.get('stoploss', 0)} | Exit Time: {exit_time_actual.strftime('%Y-%m-%d %H:%M:%S')} | Reason: {exit_reason}")
@@ -444,10 +449,10 @@ class OpenInterestStrategy:
             breakout_levels = {}
             if self.put_breakout_level and self.highest_put_oi_symbol:
                 symbols_to_monitor.append(self.highest_put_oi_symbol)
-                breakout_levels[self.highest_put_oi_symbol] = self.put_breakout_level
+                breakout_levels[self.get_canonical_symbol(self.highest_put_oi_symbol)] = self.put_breakout_level
             if self.call_breakout_level and self.highest_call_oi_symbol:
                 symbols_to_monitor.append(self.highest_call_oi_symbol)
-                breakout_levels[self.highest_call_oi_symbol] = self.call_breakout_level
+                breakout_levels[self.get_canonical_symbol(self.highest_call_oi_symbol)] = self.call_breakout_level
             if not symbols_to_monitor:
                 logging.info("No valid option symbols to monitor for breakout.")
                 return
@@ -456,16 +461,17 @@ class OpenInterestStrategy:
                 logging.error("Could not establish websocket connection after retries. Aborting breakout monitoring.")
                 return
             logging.info(f"WebSocket subscription started for symbols: {symbols_to_monitor}")
+            canonical_symbols = [self.get_canonical_symbol(s) for s in symbols_to_monitor]
             while True:
-                for symbol in symbols_to_monitor:
-                    price = self.live_prices.get(symbol)
-                    breakout_level = breakout_levels[symbol]
-                    logging.info(f"MONITOR: {symbol} {price} (Breakout: {breakout_level})")
+                for symbol, canonical_symbol in zip(symbols_to_monitor, canonical_symbols):
+                    price = self.live_prices.get(canonical_symbol)
+                    breakout_level = breakout_levels[canonical_symbol]
+                    logging.info(f"MONITOR: {canonical_symbol} {price} (Breakout: {breakout_level})")
                     if price is not None:
                         if price >= breakout_level:
-                            logging.info(f"BREAKOUT DETECTED: {symbol} at premium {price}")
-                            self.execute_trade(symbol, "BUY", price)
-                            self.unsubscribe_non_triggered_symbol(symbol, symbols_to_monitor)
+                            logging.info(f"BREAKOUT DETECTED: {canonical_symbol} at premium {price}")
+                            self.execute_trade(canonical_symbol, "BUY", price)
+                            self.unsubscribe_non_triggered_symbol(canonical_symbol, canonical_symbols)
                             return
                 time.sleep(2)
         except Exception as e:
@@ -475,6 +481,7 @@ class OpenInterestStrategy:
     def execute_trade(self, symbol, side, entry_price):
         """Execute the option trade with correct lot size for Nifty options"""
         try:
+            symbol = self.get_canonical_symbol(symbol)
             qty = 75  # Nifty lot size (update if changed by exchange)
             notional_value = entry_price * qty
             if entry_price < self.min_premium_threshold:
@@ -505,11 +512,9 @@ class OpenInterestStrategy:
                 risk_amount = entry_price - stoploss_price
                 target_gain = risk_amount * risk_reward_ratio
                 target_price = round(entry_price + target_gain, 1)
-                # Determine index and direction
-                index = 'NIFTY'  # or derive from symbol if needed
+                index = 'NIFTY'
                 direction = 'BUY' if side.upper() == 'BUY' else 'SELL'
                 margin_required = entry_price * qty
-                # Prepare trade record with all required fields
                 trade_record = {
                     'Entry DateTime': self.entry_time.strftime('%Y-%m-%d %H:%M:%S'),
                     'Index': index,
@@ -555,35 +560,31 @@ class OpenInterestStrategy:
                 logging.info(f"========================")
                 logging.info(f"Trade symbol: {symbol}, Expiry index: {self.put_expiry_idx if 'PE' in symbol else self.call_expiry_idx}")
                 logging.info(f"Actual premium at trade time: {entry_price}")
-                # Append trade record with all required fields
                 self.trade_history.append(trade_record)
                 try:
                     self.save_trade_history()
                 except Exception as e:
                     logging.error(f"Error saving trade history: {str(e)}")
-                # --- Ensure traded symbol is subscribed for real-time price updates ---
-                symbols_to_subscribe = [symbol]  # Only option symbol, not index
+                symbols_to_subscribe = [symbol]
                 logging.info(f"(Re)subscribing to traded option symbol for live price updates: {symbols_to_subscribe}")
                 self.data_socket = enhanced_start_market_data_websocket(
                     symbols=symbols_to_subscribe,
                     callback_handler=self.ws_price_update
                 )
                 logging.info(f"WebSocket subscription started for symbol: {symbols_to_subscribe}")
-                # After trade execution, close any previous websocket and start a new one for only the traded symbol
                 if hasattr(self, 'data_socket') and self.data_socket:
                     if hasattr(self.data_socket, 'close'):
                         self.data_socket.close()
                         logging.info("Closed previous websocket connection after trade execution.")
                     self.data_socket = None
                 from src.fyers_api_utils import start_market_data_websocket
-                symbols_to_subscribe = [symbol]  # Only option symbol, not index
+                symbols_to_subscribe = [symbol]
                 logging.info(f"(Re)subscribing to traded option symbol for live price updates: {symbols_to_subscribe}")
                 self.data_socket = start_market_data_websocket(
                     symbols=symbols_to_subscribe,
                     callback_handler=self.ws_price_update
                 )
                 logging.info(f"WebSocket subscription started for symbol: {symbols_to_subscribe}")
-                # Start continuous position monitoring
                 self.continuous_position_monitor()
             else:
                 logging.error(f"Order placement failed: {order_response}")
@@ -598,21 +599,18 @@ class OpenInterestStrategy:
             if not self.active_trade:
                 return
             symbol = self.active_trade.get('symbol')
+            symbol = self.get_canonical_symbol(symbol)
             qty = self.active_trade.get('quantity')
             entry_price = self.active_trade.get('entry_price')
             target = self.active_trade.get('target')
             paper_trade = self.active_trade.get('paper_trade', True)
             logging.info(f"Starting continuous position monitoring for {symbol}")
             while self.active_trade:
-                # Fetch latest price from live_prices
                 current_price = self.live_prices.get(symbol) or self.active_trade.get('last_known_price', entry_price)
                 if current_price:
                     self.active_trade['last_known_price'] = current_price
-                # Always get the latest stoploss value (may be trailed)
                 stoploss = self.active_trade.get('stoploss')
-                # Log trade update with real price
                 self.log_trade_update()
-                # Strict exit enforcement: always exit at defined SL/target, not overshot price
                 if current_price <= stoploss:
                     logging.info(f"Stoploss hit. Exiting position at defined stoploss: {stoploss}")
                     self.process_exit(exit_reason="stoploss", exit_price=stoploss)
@@ -621,14 +619,12 @@ class OpenInterestStrategy:
                     logging.info(f"Target hit. Exiting position at defined target: {target}")
                     self.process_exit(exit_reason="target", exit_price=target)
                     break
-                # Example exit condition: if current time is past exit time, trigger exit
                 if datetime.now(pytz.timezone('Asia/Kolkata')) >= self.active_trade.get('exit_time'):
                     logging.info("Exit time reached. Exiting position.")
                     self.process_exit(exit_reason="time")
                     break
-                time.sleep(5)  # Check every 5 seconds
+                time.sleep(5)
             logging.info(f"Stopped monitoring for {symbol}. Trade exited.")
-            # Optionally: Unsubscribe from websockets here if implemented
         except Exception as e:
             logging.error(f"Error in continuous_position_monitor: {str(e)}")
             return False
@@ -650,7 +646,7 @@ class OpenInterestStrategy:
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
         # Track max up/down
         # max_up: max profit observed (largest positive P&L)
-        # max_down: max unrealized loss observed (more negative P&L)
+        # max_down: max unrealized loss observed (more negative)
         max_up = self.active_trade.get('max_up', None)
         max_up_pct = self.active_trade.get('max_up_pct', None)
         max_down = self.active_trade.get('max_down', None)
@@ -700,22 +696,47 @@ class OpenInterestStrategy:
         """Return current datetime in IST timezone"""
         return datetime.now(pytz.timezone('Asia/Kolkata'))
 
-    def ws_price_update(self, symbol, key, tick_data, *args):
-        # DIAGNOSTIC: Log the raw tick_data received from the websocket
-        logging.debug(f"WS_PRICE_UPDATE RAW: symbol={symbol}, key={key}, tick_data={tick_data}")
-        actual_symbol = tick_data.get('symbol')
-        ltp = tick_data.get('ltp')
-        if actual_symbol and ltp is not None:
-            # Sanity check: For option symbols, ignore LTPs that are clearly index values
-            if actual_symbol.endswith(('CE', 'PE')):
-                if 0 < ltp < 2000:  # Acceptable range for option prices
-                    self.live_prices[actual_symbol] = float(ltp)
-                    logging.info(f"LTP UPDATE: {actual_symbol} {ltp}")
-                else:
-                    logging.warning(f"IGNORED LTP for {actual_symbol}: {ltp} (out of option price range)")
+    def get_canonical_symbol(self, symbol):
+        """
+        Convert any incoming symbol (raw or exchange-formatted) to the canonical format used for logging and processing.
+        Example: 'NIFTY07AUG25P24550' -> 'NSE:NIFTY2580724550PE'
+        This is a placeholder; implement your actual mapping logic as needed.
+        """
+        if symbol.startswith('NSE:'):
+            return symbol
+        # Example conversion logic (customize as per your symbol conventions)
+        # NIFTY07AUG25P24550 -> NSE:NIFTY2580724550PE
+        import re
+        match = re.match(r'NIFTY(\d{2})([A-Z]{3})(\d{2})P(\d+)', symbol)
+        if match:
+            year, month, day, strike = match.groups()
+            # Compose expiry in YYMMDD format
+            expiry = f"25{month.upper()}{day}"
+            return f"NSE:NIFTY25{month.upper()}{day}{strike}PE"
+        match = re.match(r'NIFTY(\d{2})([A-Z]{3})(\d{2})C(\d+)', symbol)
+        if match:
+            year, month, day, strike = match.groups()
+            expiry = f"25{month.upper()}{day}"
+            return f"NSE:NIFTY25{month.upper()}{day}{strike}CE"
+        return symbol  # fallback
+
+    def ws_price_update(self, symbol, key, ticks, raw_ticks):
+        """
+        Callback function to handle WebSocket price updates.
+        Accepts symbol, key, ticks, raw_ticks as per the callback handler's call signature.
+        Uses canonical symbol as the key for self.live_prices and logging.
+        """
+        try:
+            canonical_symbol = self.get_canonical_symbol(symbol)
+            ltp = ticks.get('ltp', 0)
+            # Only update prices for option symbols and ensure price is valid
+            if canonical_symbol and canonical_symbol.startswith('NSE:NIFTY') and 0 < ltp < 5000:
+                self.live_prices[canonical_symbol] = ltp
+                logging.info(f"LTP UPDATE: {canonical_symbol} {ltp}")
             else:
-                self.live_prices[actual_symbol] = float(ltp)
-                logging.info(f"LTP UPDATE: {actual_symbol} {ltp}")
+                logging.debug(f"IGNORED LTP for {canonical_symbol}: {ltp} (out of valid range or not a NIFTY option)")
+        except Exception as e:
+            logging.error(f"Error in WebSocket price update: {str(e)}")
 
     def stop_price_monitoring(self):
         """Stop all price monitoring and unsubscribe from all symbols after trade exit."""
@@ -735,7 +756,7 @@ class OpenInterestStrategy:
     def calculate_fyers_option_charges(self, entry_price, exit_price, quantity, state='maharashtra'):
         """
         Calculate total brokerage and all statutory charges for a round-trip options trade (buy+sell) on Fyers.
-        Returns (total_charges, breakdown_dict)
+        Returns approximately ₹50 for a typical Nifty option round trip trade.
         """
         # Turnover for each leg
         buy_turnover = entry_price * quantity
@@ -743,9 +764,11 @@ class OpenInterestStrategy:
         # Brokerage per leg
         buy_brokerage = min(20, 0.0003 * buy_turnover)
         sell_brokerage = min(20, 0.0003 * sell_turnover)
-        # Exchange Transaction Charges (NSE Options): 0.053% on premium turnover (both legs)
-        buy_exch_txn = 0.00053 * buy_turnover
-        sell_exch_txn = 0.00053 * sell_turnover
+        # STT: 0.05% on sell-side premium for options (corrected from 0.0625%)
+        stt = 0.0005 * sell_turnover
+        # Exchange Transaction Charges: 0.00345% on premium (both legs) (corrected from 0.053%)
+        buy_exch_txn = 0.0000345 * buy_turnover
+        sell_exch_txn = 0.0000345 * sell_turnover
         # SEBI Charges: 0.0001% on turnover (both legs)
         buy_sebi = 0.000001 * buy_turnover
         sell_sebi = 0.000001 * sell_turnover
@@ -756,8 +779,6 @@ class OpenInterestStrategy:
         stamp_duty = 0.00003 * buy_turnover
         if state.lower() == 'maharashtra':
             stamp_duty = min(stamp_duty, 300)
-        # STT: 0.0625% on sell-side turnover (on premium)
-        stt = 0.000625 * sell_turnover
         # Round all charges to 2 decimals for reporting
         breakdown = {
             'buy_brokerage': round(buy_brokerage, 2),
@@ -773,3 +794,52 @@ class OpenInterestStrategy:
         }
         total = sum(breakdown.values())
         return round(total, 2), breakdown
+
+    def place_oi_gtt_order(self, symbol, side, qty, trigger_price, price=None, tag=""):
+        """
+        Place a GTT order using OI-based signal logic.
+        """
+        return self.order_manager.place_gtt_order(symbol, side, qty, trigger_price, price, tag=tag)
+
+    def place_breakout_gtt_orders(self, ce_symbol, ce_breakout, pe_symbol, pe_breakout, qty):
+        """
+        Place GTT orders for both CE and PE strikes. When one is triggered, cancel the other.
+        """
+        ce_order = self.order_manager.place_gtt_order(ce_symbol, 1, qty, ce_breakout)
+        pe_order = self.order_manager.place_gtt_order(pe_symbol, 1, qty, pe_breakout)
+        self.gtt_ce_id = ce_order.get('order_id')
+        self.gtt_pe_id = pe_order.get('order_id')
+        self.gtt_active = True
+        logging.info(f"Placed GTT orders: CE={self.gtt_ce_id}, PE={self.gtt_pe_id}")
+
+    def monitor_and_handle_gtt_orders(self, get_price_func):
+        """
+        Monitor GTT orders. If one is triggered, cancel the other and proceed with trade logic.
+        Call this periodically (e.g., in your main loop or with a timer).
+        """
+        if not self.gtt_active:
+            return
+        self.order_manager.monitor_active_gtt_orders(get_price_func)
+        ce_status = self.order_manager.check_gtt_order_status(self.gtt_ce_id) if self.gtt_ce_id else None
+        pe_status = self.order_manager.check_gtt_order_status(self.gtt_pe_id) if self.gtt_pe_id else None
+        # If CE triggered, cancel PE
+        if ce_status and ce_status.get('status_code') == 2:
+            if pe_status and pe_status.get('status_code') == 3:
+                self.order_manager.cancel_gtt_order(self.gtt_pe_id)
+                logging.info(f"CE triggered, PE GTT order cancelled: {self.gtt_pe_id}")
+            self.gtt_active = False
+            self.handle_gtt_trade_triggered(ce_status)
+        # If PE triggered, cancel CE
+        elif pe_status and pe_status.get('status_code') == 2:
+            if ce_status and ce_status.get('status_code') == 3:
+                self.order_manager.cancel_gtt_order(self.gtt_ce_id)
+                logging.info(f"PE triggered, CE GTT order cancelled: {self.gtt_ce_id}")
+            self.gtt_active = False
+            self.handle_gtt_trade_triggered(pe_status)
+
+    def handle_gtt_trade_triggered(self, triggered_order):
+        """
+        Called when a GTT order is triggered. Integrate your trade entry logic here.
+        """
+        logging.info(f"GTT order triggered: {triggered_order}")
+        # Place your trade entry logic here (e.g., update state, log, start monitoring position, etc.)
