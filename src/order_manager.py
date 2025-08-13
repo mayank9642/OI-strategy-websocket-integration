@@ -46,7 +46,7 @@ class OrderManager:
                 if group_id not in self.gtt_groups:
                     self.gtt_groups[group_id] = set()
                 self.gtt_groups[group_id].add(order_id)
-        logging.info(f"GTT order placed: {order}")
+        logging.info(f"[ORDER_MANAGER] GTT order placed: {order}")
         if self.paper_trading:
             return {"order_id": order_id, "status": "pending", "order": order}
         # TODO: Integrate with broker API for live trading
@@ -131,6 +131,9 @@ class OrderManager:
                     order['status_code'] = GTTOrderStatus.ERROR.value
                     order['error'] = str(e)
                     logging.error(f"Error getting price for {symbol}: {e}")
+                    continue
+                if price is None:
+                    logging.warning(f"Skipping GTT trigger check for {symbol}: price is None")
                     continue
                 if (side == 1 and price >= trigger_price) or (side == -1 and price <= trigger_price):
                     order['status_code'] = GTTOrderStatus.TRIGGERED.value

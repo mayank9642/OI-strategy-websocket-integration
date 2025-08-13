@@ -97,6 +97,46 @@
 - Provides clearer and more consistent trade status information
 - Makes it easier to track position performance throughout the trade duration
 
+## GTT Order Management & Mutual Exclusivity (August 2025)
+
+### Overview
+This project now features robust GTT (Good Till Trigger) order management for options OI breakout strategies. The system can place GTT orders for both CE and PE strikes after breakout levels are finalized, and ensures only one side is traded by automatically cancelling the other GTT order when one is triggered.
+
+### Key Features
+- **GTT Order Placement:**
+  - Places GTT orders for both CE and PE strikes at their respective breakout levels.
+  - Each GTT order is tracked by a unique ID and managed by the `OrderManager` class.
+- **Mutual Exclusivity:**
+  - When one GTT order (e.g., CE) is triggered, the other (e.g., PE) is automatically cancelled.
+  - This ensures only one trade is executed per breakout event, preventing double entry.
+- **Order Lifecycle Management:**
+  - Orders are monitored for trigger, expiry, and cancellation.
+  - All order state transitions are logged for traceability.
+- **Thread Safety:**
+  - All order management operations are thread-safe, supporting concurrent price updates and order actions.
+- **Paper & Live Trading Support:**
+  - Fully supports paper trading mode for safe testing.
+  - Stubs provided for broker API integration for live trading.
+- **Logging:**
+  - All GTT order events (placement, trigger, cancel, expiry, error) are logged in detail.
+- **Unit Tested:**
+  - Comprehensive unit tests for all GTT order management logic.
+
+### Example Log Output
+```
+Placed GTT orders: CE=abc123, PE=def456
+GTT order triggered: {'order_id': 'abc123', ...}
+CE triggered, PE GTT order cancelled: def456
+```
+
+### How It Works
+1. After OI analysis, GTT orders are placed for both CE and PE strikes.
+2. The system monitors both orders in real time.
+3. When one order is triggered, the other is cancelled automatically.
+4. Only the triggered side proceeds to trade logic and position management.
+
+See `src/order_manager.py` and `src/strategy.py` for implementation details.
+
 ## How to Use
 
 ### Running the Strategy

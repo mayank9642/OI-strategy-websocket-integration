@@ -400,12 +400,25 @@ class OpenInterestStrategy:
                     logging.error("OI analysis failed. Exiting strategy run.")
                     return {"success": False, "message": "OI analysis failed"}
                 logging.info(f"Breakout levels: PUT={self.put_breakout_level}, CALL={self.call_breakout_level}")
-            # Step 2: Monitor for breakouts and execute trades
-            if self.highest_put_oi_strike or self.highest_call_oi_strike:
-                if not self.active_trade and not self.trade_taken_today:
-                    self.monitor_for_breakout()
-                elif self.trade_taken_today and not self.active_trade:
-                    logging.info("Daily trade limit: Trade already taken today. Skipping breakout monitoring.")
+                # --- GTT Order Placement Integration ---
+                if self.highest_call_oi_symbol and self.call_breakout_level and self.highest_put_oi_symbol and self.put_breakout_level:
+                    qty = 75  # Nifty lot size (update if needed)
+                    self.place_breakout_gtt_orders(
+                        ce_symbol=self.highest_call_oi_symbol,
+                        ce_breakout=self.call_breakout_level,
+                        pe_symbol=self.highest_put_oi_symbol,
+                        pe_breakout=self.put_breakout_level,
+                        qty=qty
+                    )
+                    logging.info("GTT order placement logic executed after OI analysis.")
+                else:
+                    logging.warning("GTT order placement skipped: missing symbol or breakout level.")
+            # Step 2: Monitor for GTT triggers and handle them
+            if self.gtt_active:
+                def get_price_func(symbol):
+                    canonical_symbol = self.get_canonical_symbol(symbol)
+                    return self.live_prices.get(canonical_symbol)
+                self.monitor_and_handle_gtt_orders(get_price_func)
             # Position management is handled by continuous_position_monitor thread
             logging.info("Strategy execution completed successfully")
             return {"success": True, "message": "Strategy executed successfully"}
@@ -619,7 +632,8 @@ class OpenInterestStrategy:
                     logging.info(f"Target hit. Exiting position at defined target: {target}")
                     self.process_exit(exit_reason="target", exit_price=target)
                     break
-                if datetime.now(pytz.timezone('Asia/Kolkata')) >= self.active_trade.get('exit_time'):
+                exit_time = self.active_trade.get('exit_time')
+                if exit_time is not None and datetime.now(pytz.timezone('Asia/Kolkata')) >= exit_time:
                     logging.info("Exit time reached. Exiting position.")
                     self.process_exit(exit_reason="time")
                     break
@@ -804,13 +818,75 @@ class OpenInterestStrategy:
     def place_breakout_gtt_orders(self, ce_symbol, ce_breakout, pe_symbol, pe_breakout, qty):
         """
         Place GTT orders for both CE and PE strikes. When one is triggered, cancel the other.
+        Also (re)subscribe to both symbols for live price updates to ensure GTT triggers work.
         """
-        ce_order = self.order_manager.place_gtt_order(ce_symbol, 1, qty, ce_breakout)
-        pe_order = self.order_manager.place_gtt_order(pe_symbol, 1, qty, pe_breakout)
+        # Use canonical symbols for all GTT logic
+        ce_symbol_canon = self.get_canonical_symbol(ce_symbol)
+        pe_symbol_canon = self.get_canonical_symbol(pe_symbol)
+        logging.info(f"[STRATEGY] Initiating GTT order placement: CE={ce_symbol_canon} @ {ce_breakout}, PE={pe_symbol_canon} @ {pe_breakout}, Qty={qty}")
+        ce_order = self.order_manager.place_gtt_order(ce_symbol_canon, 1, qty, ce_breakout)
+        pe_order = self.order_manager.place_gtt_order(pe_symbol_canon, 1, qty, pe_breakout)
         self.gtt_ce_id = ce_order.get('order_id')
         self.gtt_pe_id = pe_order.get('order_id')
         self.gtt_active = True
-        logging.info(f"Placed GTT orders: CE={self.gtt_ce_id}, PE={self.gtt_pe_id}")
+        logging.info(f"[STRATEGY] Placed GTT orders: CE={self.gtt_ce_id}, PE={self.gtt_pe_id}")
+
+        # --- Ensure websocket is subscribed to both GTT symbols for live price updates ---
+        gtt_symbols = [ce_symbol_canon, pe_symbol_canon]
+        try:
+            self.data_socket = enhanced_start_market_data_websocket(
+                symbols=gtt_symbols,
+                callback_handler=self.ws_price_update
+            )
+            logging.info(f"Subscribed to GTT symbols for live price updates: {gtt_symbols}")
+        except Exception as e:
+            logging.error(f"Error subscribing to GTT symbols {gtt_symbols}: {e}")
+
+        # --- Wait for first price update for both GTT symbols before starting GTT monitor ---
+        import threading
+        import time
+        def _wait_for_gtt_prices():
+            timeout = 10  # seconds
+            poll_interval = 0.2
+            waited = 0
+            while waited < timeout:
+                ce_price = self.live_prices.get(ce_symbol_canon)
+                pe_price = self.live_prices.get(pe_symbol_canon)
+                if ce_price is not None and pe_price is not None:
+                    logging.info(f"[GTT-READY] First price update received for both GTT symbols: CE={ce_price}, PE={pe_price}")
+                    return True
+                time.sleep(poll_interval)
+                waited += poll_interval
+            # Timeout
+            if self.live_prices.get(ce_symbol_canon) is None:
+                logging.error(f"[GTT-ERROR] No price update for {ce_symbol_canon} after {timeout}s. GTT monitoring will NOT start.")
+            if self.live_prices.get(pe_symbol_canon) is None:
+                logging.error(f"[GTT-ERROR] No price update for {pe_symbol_canon} after {timeout}s. GTT monitoring will NOT start.")
+            return False
+
+        if not _wait_for_gtt_prices():
+            logging.error("[GTT-ABORT] GTT monitoring aborted due to missing price data for one or both symbols.")
+            self.gtt_active = False
+            return
+
+        # --- Diagnostic: Wait 5 seconds, then log live_prices for both symbols ---
+        def _diagnose_gtt_price_updates():
+            time.sleep(5)
+            ce_price = self.live_prices.get(ce_symbol_canon)
+            pe_price = self.live_prices.get(pe_symbol_canon)
+            logging.info(f"[DIAGNOSTIC] 5s after GTT subscription: CE price={ce_price}, PE price={pe_price}")
+            if ce_price is None:
+                logging.error(f"[DIAGNOSTIC] No price updates received for {ce_symbol_canon} after GTT subscription!")
+            if pe_price is None:
+                logging.error(f"[DIAGNOSTIC] No price updates received for {pe_symbol_canon} after GTT subscription!")
+        threading.Thread(target=_diagnose_gtt_price_updates, daemon=True).start()
+
+        # --- Start background thread to monitor GTT orders every 1 second ---
+        def _gtt_monitor_loop():
+            while self.gtt_active:
+                self.monitor_and_handle_gtt_orders(lambda sym: self.live_prices.get(self.get_canonical_symbol(sym)))
+                time.sleep(1)
+        threading.Thread(target=_gtt_monitor_loop, daemon=True).start()
 
     def monitor_and_handle_gtt_orders(self, get_price_func):
         """
@@ -839,7 +915,74 @@ class OpenInterestStrategy:
 
     def handle_gtt_trade_triggered(self, triggered_order):
         """
-        Called when a GTT order is triggered. Integrate your trade entry logic here.
+        Called when a GTT order is triggered. Executes trade entry logic, logs, records to Excel/CSV, and starts monitoring.
         """
+        import pytz
+        from datetime import datetime, timedelta
         logging.info(f"GTT order triggered: {triggered_order}")
-        # Place your trade entry logic here (e.g., update state, log, start monitoring position, etc.)
+        symbol = triggered_order.get('symbol')
+        entry_price = triggered_order.get('price') or triggered_order.get('trigger_price')
+        qty = triggered_order.get('qty')
+        direction = 'BUY' if triggered_order.get('side', 1) == 1 else 'SELL'
+        entry_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+        # Set stoploss and target as 20% SL, 30% target by default (customize as needed)
+        stoploss = round(entry_price * 0.8, 2)
+        target = round(entry_price * 1.3, 2)
+        trailing_sl = stoploss
+        # Prepare trade record
+        trade_record = {
+            'Entry DateTime': entry_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'Index': 'NIFTY',
+            'Symbol': symbol,
+            'Direction': direction,
+            'Entry Price': entry_price,
+            'Exit DateTime': '',
+            'Exit Price': '',
+            'Stop Loss': stoploss,
+            'Target': target,
+            'Trailing SL': trailing_sl,
+            'Quantity': qty,
+            'Brokerage': '',
+            'P&L': '',
+            'Margin Required': '',
+            '% Gain/Loss': '',
+            'max up': '',
+            'max down': '',
+            'max up %': '',
+            'max down %': ''
+        }
+        # Add to trade history and save
+        self.trade_history.append(trade_record)
+        trade_record_idx = len(self.trade_history) - 1
+        try:
+            self.save_trade_history()
+        except Exception as e:
+            logging.error(f"Error saving trade history after GTT trigger: {str(e)}")
+        # Set up active_trade for monitoring
+        self.active_trade = {
+            'symbol': symbol,
+            'entry_price': entry_price,
+            'stoploss': stoploss,
+            'target': target,
+            'trailing_stoploss': trailing_sl,
+            'quantity': qty,
+            'entry_time': entry_time,
+            'trade_record_idx': trade_record_idx,
+            'direction': direction,
+            'max_up': 0,
+            'max_down': 0,
+            'max_up_pct': 0,
+            'max_down_pct': 0
+        }
+        self.trade_taken_today = True
+        logging.info(f"=== {'PAPER' if self.paper_trading else 'LIVE'} TRADE EXECUTED ===")
+        logging.info(f"Symbol: {symbol}")
+        logging.info(f"Entry Price: {entry_price}")
+        logging.info(f"Quantity: {qty}")
+        logging.info(f"Entry Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"Stoploss: {stoploss}")
+        logging.info(f"Target: {target}")
+        logging.info(f"Starting continuous position monitoring for {symbol}")
+        # Start monitoring thread for this trade
+        self.continuous_position_monitor()
+        logging.info(f"Trade entry, monitoring, and logging complete for {symbol} after GTT trigger.")
