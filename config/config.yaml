@@ -1,0 +1,29 @@
+fyers:
+  access_token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIiwieDoyIl0sImF0X2hhc2giOiJnQUFBQUFCbzAyalB0eUNZVkthRExSUXNHM0p0TnpyalJrWXlGazIzUWZ2clRKWDBpT1NqS0t6amZjOW5aRmNoR3Q2MUlqVUpCQnNIcDJGbDZnUk5ONXZYV3d5b1g3NjNBcXBQNER0dXEtRDV1SVJaUWo5ZXU4Yz0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiIyOGE1NGQwMTJhNWI5ZWU4ZGFjMGU1YmM4MmYyN2U4ODBhZWM0NmE2YzY4YmQ2ZWQ2NjMzZTkyNiIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWU0wNDA3NyIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzU4NzYwMjAwLCJpYXQiOjE3NTg2ODUzOTEsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc1ODY4NTM5MSwic3ViIjoiYWNjZXNzX3Rva2VuIn0.yGjudmZYmNRPEjiQoEWH2Smaeop3JWV7XbDcDB-pcZo
+  client_id: QZAWYQ69KZ-100
+  redirect_uri: https://trade.fyers.in/api-login/redirect-uri/index.html
+  secret_key: J02WG5J3V9
+  token_expiry: '2025-09-25 16:43:11'
+  totp_key: ''
+logging:
+  file: logs/strategy.log
+  level: INFO
+strategy:
+  analysis_time: 09:20
+  breakout_pct: 10
+  max_holding_minutes: 30
+  max_strike_distance: 500
+  min_premium_threshold: 50.0
+  partial_exits:
+  - exit_percentage: 30
+    min_profit_pct: 8
+    time_minutes: 10
+  - exit_percentage: 40
+    min_profit_pct: 12
+    time_minutes: 20
+  risk_reward_ratio: 2
+  stoploss_pct: 20
+  symbol: NSE:NIFTY50-INDEX
+  trailing_stop_pct: 8
+  trailing_trigger_pct: 12
+  use_trailing_stop: true
