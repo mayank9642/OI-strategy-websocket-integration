@@ -1,3 +1,0 @@
-Script started at 2025-07-30 20:55:08.827379
-Importing FixedOpenInterestStrategy...
-Import successful
