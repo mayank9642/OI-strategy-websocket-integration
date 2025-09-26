@@ -1,6 +1,14 @@
 # OI Strategy Enhancements Summary
 
-## Implemented Enhancements
+## Latest Enhancements (September 2025)
+
+### 1. Fixed Max Up/Down Trade Value Tracking
+- Fixed critical indentation error in the `continuous_position_monitor` function that prevented max up/down values from being tracked
+- Added enhanced logging for max up/down value changes during trade monitoring
+- Ensured consistent price data updates between different data sources
+- Added explicit verification logs at trade exit to confirm max values are captured correctly
+
+## Previously Implemented Enhancements
 
 ### 1. Fixed Symbol Format for Fyers API
 - Updated the option symbol generation to follow Fyers API format: `NSE:NIFTY25JUN19500CE`

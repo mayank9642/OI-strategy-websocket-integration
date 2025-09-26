@@ -85,18 +85,46 @@ class OpenInterestStrategy:
             symbol_type = "CE"
         elif "PE" in symbol:
             symbol_type = "PE"
+        else:
+            logging.error(f"Cannot determine option type for {symbol} in update_trailing_stoploss")
+            return False
             
+        # Ensure symbol ends with the correct option type to prevent mixups
+        if symbol_type == "CE" and not symbol.endswith("CE"):
+            logging.error(f"Symbol {symbol} should end with 'CE' - possible format error")
+            return False
+        elif symbol_type == "PE" and not symbol.endswith("PE"):
+            logging.error(f"Symbol {symbol} should end with 'PE' - possible format error")
+            return False
+        
+        # IMPROVED PRICE VALIDATION:
+        # 1. First get price from data_manager (most reliable source)
+        # 2. Compare with provided price and live_prices for consistency
+        # 3. Use the most reliable price for stoploss updates
+        
+        # Get price from data_manager for verification
+        dm_price = data_manager.get_ltp(symbol)
+        
+        # Get price from live_prices dictionary for verification
+        live_price = self.live_prices.get(symbol)
+        
+        logging.info(f"PRICE COMPARISON for {symbol} ({symbol_type}): provided={current_price}, data_manager={dm_price}, live_prices={live_price}")
+        
         # Verify the price looks reasonable compared to entry price (no more than 50% decrease or 200% increase)
         if current_price < entry_price * 0.5 or current_price > entry_price * 3.0:
             logging.warning(f"Price for {symbol} ({symbol_type}) looks suspicious: entry={entry_price}, current={current_price} - needs verification")
-            logging.warning("Running additional validation to prevent incorrect stoploss update")
             
-            # Get the price directly from live_prices with explicit symbol match
-            live_price = self.live_prices.get(symbol)
-            if live_price and abs(live_price - current_price) > entry_price * 0.1:
-                logging.warning(f"Possible price mixup detected! Provided price: {current_price}, Live price: {live_price}")
-                logging.warning(f"Using verified live price instead for {symbol}")
+            # Check data_manager price first as it's most reliable
+            if dm_price is not None and abs(dm_price - current_price) > entry_price * 0.1:
+                logging.warning(f"Using data_manager price {dm_price} instead of suspicious price {current_price}")
+                current_price = dm_price
+            # If no data_manager price, fall back to live_prices
+            elif live_price is not None and abs(live_price - current_price) > entry_price * 0.1:
+                logging.warning(f"Using live_prices price {live_price} instead of suspicious price {current_price}")
                 current_price = live_price
+                
+        # Always update data_manager with the verified price for consistency
+        data_manager.update_ltp(symbol, current_price)
 
         # First time trailing SL is called, store the original stoploss
         if 'original_stoploss' not in self.active_trade:
@@ -230,6 +258,9 @@ class OpenInterestStrategy:
         max_down = self.active_trade.get('max_down', '')
         max_up_pct = self.active_trade.get('max_up_pct', '')
         max_down_pct = self.active_trade.get('max_down_pct', '')
+        
+        # Log max up/down values for verification
+        logging.info(f"FINAL_MAX_VALUES | Symbol: {symbol} | MaxUP: {max_up if isinstance(max_up, (int, float)) else 0:.2f} ({max_up_pct if isinstance(max_up_pct, (int, float)) else 0:.2f}%) | MaxDN: {max_down if isinstance(max_down, (int, float)) else 0:.2f} ({max_down_pct if isinstance(max_down_pct, (int, float)) else 0:.2f}%)")
         # Update trade record in history
         idx = self.active_trade.get('trade_record_idx')
         margin_required = entry_price * quantity
@@ -755,6 +786,9 @@ class OpenInterestStrategy:
             symbol = self.active_trade.get('symbol')
             exit_time = self.active_trade.get('exit_time')
             entry_time = self.active_trade.get('entry_time')
+            
+            # Add startup logging for position monitor
+            logging.info(f"Starting continuous position monitoring for {symbol}")
             while self.active_trade:
                 current_time = datetime.now(pytz.timezone('Asia/Kolkata'))
                 # Strict 30-min hard limit using entry_time
@@ -768,61 +802,121 @@ class OpenInterestStrategy:
                     self.process_exit(exit_reason="time")
                     break
                 
-                # Try to get the current price from our data manager first
-                current_price = data_manager.get_ltp(symbol)
+                # Cleanup stale data every iteration to prevent mixups
+                data_manager.cleanup_stale_data(max_age_seconds=10)
                 
-                # Fall back to live_prices if data manager doesn't have the price
+                # Extract option type for validation
+                symbol_option_type = 'CE' if 'CE' in symbol else ('PE' if 'PE' in symbol else None)
+                if not symbol_option_type:
+                    logging.error(f"Invalid symbol format, cannot determine option type: {symbol}")
+                    self.process_exit(exit_reason="INVALID_SYMBOL")
+                    break
+                
+                # Additional validation: ensure symbol ends with correct option type
+                if symbol_option_type == 'CE' and not symbol.endswith('CE'):
+                    logging.error(f"Symbol {symbol} doesn't end with expected 'CE' suffix")
+                    self.process_exit(exit_reason="INVALID_SYMBOL_FORMAT")
+                    break
+                elif symbol_option_type == 'PE' and not symbol.endswith('PE'):
+                    logging.error(f"Symbol {symbol} doesn't end with expected 'PE' suffix")
+                    self.process_exit(exit_reason="INVALID_SYMBOL_FORMAT")
+                    break
+                
+                # Try to get the current price from our data manager first - this is the most reliable source
+                current_price = data_manager.get_ltp(symbol)
+                price_source = None
+                
+                # Check if this symbol has multiple data streams and get primary stream ID
+                primary_stream_id = data_manager.primary_stream_ids.get(symbol)
+                if primary_stream_id:
+                    logging.debug(f"Using primary stream for {symbol}: {primary_stream_id}")
+                
+                # Fall back strategies if data_manager doesn't have the price
                 if current_price is None:
-                    current_price = self.live_prices.get(symbol) or self.active_trade.get('last_known_price')
+                    # Log a warning since data_manager should always have prices for the active trade
+                    logging.warning(f"No price found in data_manager for active trade symbol: {symbol}")
+                    
+                    # Only use live_prices for the EXACT same symbol
+                    if symbol in self.live_prices:
+                        current_price = self.live_prices.get(symbol)
+                        price_source = "live_prices fallback"
+                    else:
+                        # Last resort: use last known price
+                        current_price = self.active_trade.get('last_known_price')
+                        price_source = "last_known_price fallback"
+                        
+                    # If we found a price from fallback, update the data_manager to ensure consistency
+                    if current_price is not None:
+                        logging.info(f"Updating data_manager with fallback price for {symbol}: {current_price}")
+                        # Get volume from the active trade if available
+                        volume_traded = self.active_trade.get('volume_traded')
+                        data_manager.update_ltp(symbol, current_price, volume_traded=volume_traded)
+                else:
+                    price_source = "data_manager primary"
                 
                 # Verify that we have a valid price from the correct symbol
-                if current_price:
+                if current_price is not None:
                     # Log the price source for diagnostics
-                    if data_manager.has_data_for_symbol(symbol):
-                        price_source = "data manager"
-                    elif symbol in self.live_prices:
-                        price_source = "live prices dictionary"
-                    else:
-                        price_source = "last known price"
+                    logging.info(f"PRICE SOURCE: {price_source} for {symbol}")
                     
-                    # Get the websocket price for comparison
-                    ws_price = self.live_prices.get(symbol)
-                    if ws_price is not None and abs(ws_price - current_price) > 5:
-                        logging.warning(f"PRICE DISCREPANCY DETECTED: data_manager={current_price}, websocket={ws_price} - using websocket price for SL/Target check")
+                    # Log symbol details for debugging
+                    logging.info(f"SYMBOL VALIDATION: {symbol} (type: {symbol_option_type})")
+                    
+                    # Check for price consistency between data sources
+                    if symbol in self.live_prices:
+                        ws_price = self.live_prices.get(symbol)
+                        if ws_price is not None:
+                            price_diff = abs(ws_price - current_price)
+                            if price_diff > 5:
+                                logging.warning(f"PRICE DISCREPANCY DETECTED: data_manager={current_price}, websocket={ws_price}, diff={price_diff}")
+                                
+                                # Only use websocket price if it's significantly different and more recent
+                                if price_diff > 10 and data_manager.get_age_seconds(symbol) > 5:
+                                    logging.warning(f"Using websocket price due to significant discrepancy and stale data_manager data")
+                                    current_price = ws_price
+                                    price_source = "websocket override"
+                                    # Update data_manager for consistency
+                                    data_manager.update_ltp(symbol, current_price)
+                            else:
+                                logging.debug(f"Price consistency check passed: data_manager={current_price}, websocket={ws_price}")
+                else:
+                    logging.error(f"No valid price available for {symbol} from any source")
+                    continue
+                
+                # This code was previously misindented and unreachable after the continue statement
+                logging.info(f"Position monitor price for {symbol}: {current_price} (source: {price_source})")
+                
+                # Store the last known price for reference
+                self.active_trade['last_known_price'] = current_price
+                
+                # Explicitly update price data and force monitoring data updates
+                data_manager.update_ltp(symbol, current_price)
+                
+                # Check for stale data - if the data_manager price is stale, force an update from WebSocket
+                if data_manager.has_data_for_symbol(symbol) and symbol in self.live_prices:
+                    data_age = data_manager.get_age_seconds(symbol)
+                    if data_age and data_age > 10:  # Data is considered stale if older than 10 seconds
+                        ws_price = self.live_prices.get(symbol)
+                        logging.warning(f"STALE DATA DETECTED: data_manager price is {data_age:.1f} seconds old. Updating from WebSocket: {ws_price}")
+                        data_manager.update_ltp(symbol, ws_price)
                         current_price = ws_price
-                        price_source = "websocket (overriding data_manager due to discrepancy)"
-                    
-                    logging.info(f"Position monitor price for {symbol}: {current_price} (source: {price_source})")
-                    
-                    
-                    # Store the last known price for reference
-                    self.active_trade['last_known_price'] = current_price
-                    
-                    # Check for stale data - if the data_manager price is stale, force an update from WebSocket
-                    if data_manager.has_data_for_symbol(symbol) and symbol in self.live_prices:
-                        data_age = data_manager.get_age_seconds(symbol)
-                        if data_age and data_age > 10:  # Data is considered stale if older than 10 seconds
-                            ws_price = self.live_prices.get(symbol)
-                            logging.warning(f"STALE DATA DETECTED: data_manager price is {data_age:.1f} seconds old. Updating from WebSocket: {ws_price}")
-                            data_manager.update_ltp(symbol, ws_price)
-                            current_price = ws_price
-                    
-                    # Debug logs for stoploss and target
-                    stoploss = self.active_trade.get('stoploss')
-                    target = self.active_trade.get('target')
-                    logging.info(f"SL/Target check: Current: {current_price}, SL: {stoploss}, Target: {target}")
-                    
-                    self.log_trade_update()
-                    
-                    # Check for stoploss and target hit
-                    if current_price <= stoploss:
-                        logging.info(f"Stoploss hit. Exiting position at defined stoploss: {stoploss}. Current price: {current_price}")
-                        self.process_exit(exit_reason="stoploss", exit_price=stoploss)
-                        break
-                    elif current_price >= target:
-                        logging.info(f"Target hit. Exiting position at defined target: {target}. Current price: {current_price}")
-                        self.process_exit(exit_reason="target", exit_price=target)
-                        break
+                
+                # Debug logs for stoploss and target
+                stoploss = self.active_trade.get('stoploss')
+                target = self.active_trade.get('target')
+                logging.info(f"SL/Target check: Current: {current_price}, SL: {stoploss}, Target: {target}")
+                
+                self.log_trade_update()
+                
+                # Check for stoploss and target hit
+                if current_price <= stoploss:
+                    logging.info(f"Stoploss hit. Exiting position at defined stoploss: {stoploss}. Current price: {current_price}")
+                    self.process_exit(exit_reason="stoploss", exit_price=stoploss)
+                    break
+                elif current_price >= target:
+                    logging.info(f"Target hit. Exiting position at defined target: {target}. Current price: {current_price}")
+                    self.process_exit(exit_reason="target", exit_price=target)
+                    break
 
                 # If trade was exited in process_exit, break loop
                 if not self.active_trade:
@@ -836,7 +930,10 @@ class OpenInterestStrategy:
     def log_trade_update(self):
         """Log trade update and monitoring info after entry, including P&L, max up/down, trailing SL"""
         if not self.active_trade:
+            logging.debug("log_trade_update called but no active trade exists")
             return
+            
+        logging.debug("log_trade_update called - updating trade monitoring data")
         symbol = self.active_trade.get('symbol')
         entry_price = self.active_trade.get('entry_price')
         stoploss = self.active_trade.get('stoploss')
@@ -856,12 +953,19 @@ class OpenInterestStrategy:
         trailing_sl = stoploss
         # Update max up only if unrealized profit increases
         if pnl > 0 and (max_up is None or pnl > max_up):
+            old_max_up = self.active_trade.get('max_up', 0)
+            old_max_up_pct = self.active_trade.get('max_up_pct', 0)
             self.active_trade['max_up'] = pnl
             self.active_trade['max_up_pct'] = pnl_pct
+            logging.info(f"MAX_UP updated: {old_max_up:.2f} ({old_max_up_pct:.2f}%) → {pnl:.2f} ({pnl_pct:.2f}%)")
+        
         # Update max down only if unrealized loss increases (more negative)
         if pnl < 0 and (max_down is None or pnl < max_down):
+            old_max_down = self.active_trade.get('max_down', 0)
+            old_max_down_pct = self.active_trade.get('max_down_pct', 0)
             self.active_trade['max_down'] = pnl
             self.active_trade['max_down_pct'] = pnl_pct
+            logging.info(f"MAX_DOWN updated: {old_max_down:.2f} ({old_max_down_pct:.2f}%) → {pnl:.2f} ({pnl_pct:.2f}%)")
         # Trailing SL logic: only trail if profit exceeds 20%
         profit_threshold = 20
         if pnl_pct >= profit_threshold:
@@ -945,55 +1049,73 @@ class OpenInterestStrategy:
             with self._ws_lock:  # Ensure thread safety
                 canonical_symbol = self.get_canonical_symbol(symbol)
                 ltp = ticks.get('ltp', 0)
+                
                 # Log the full tick data for every callback for diagnosis
                 logging.info(f"WS CALLBACK: symbol={symbol}, canonical={canonical_symbol}, ltp={ltp}, ws_ticks={ticks}, raw_ticks={raw_ticks}")
 
-                if self.active_trade:
-                    traded_symbol = self.active_trade.get('symbol')
-                    import re
-                    traded_match = re.match(r"NSE:NIFTY(\d{2})([A-Z]{3})(\d{2})(\d+)(CE|PE)", traded_symbol or "")
-                    if traded_match:
-                        t_day, t_month, t_year, t_strike, t_type = traded_match.groups()
-                        tick_type = ticks.get('option_type')
-                        tick_strike = str(ticks.get('strikePrice')) if 'strikePrice' in ticks else None
-
-                        if tick_type and tick_strike:
-                            if tick_type != t_type or tick_strike != t_strike:
-                                logging.warning(f"Filtered out tick for {symbol}: tick_type={tick_type}, tick_strike={tick_strike}, expected_type={t_type}, expected_strike={t_strike}")
-                                return                # Extract option type from symbol to prevent mixups between CE and PE
+                # Extract option type from symbol to prevent mixups between CE and PE
                 option_type = None
                 if 'CE' in canonical_symbol:
                     option_type = 'CE'
                 elif 'PE' in canonical_symbol:
                     option_type = 'PE'
+                else:
+                    logging.warning(f"Cannot determine option type from symbol: {canonical_symbol}")
+                    return
                 
                 # Validate the price is reasonable for an option before updating
-                if canonical_symbol.startswith('NSE:NIFTY') and 0 < ltp < 5000:
-                    # Store the price with the exact canonical symbol to prevent mixup
+                if not (canonical_symbol.startswith('NSE:NIFTY') and 0 < ltp < 5000):
+                    logging.warning(f"Price validation failed for {canonical_symbol}: LTP={ltp}")
+                    return
+                    
+                # Double-check option type for additional validation
+                symbol_option_type = 'CE' if 'CE' in canonical_symbol else ('PE' if 'PE' in canonical_symbol else None)
+                
+                # For additional safety, verify the symbol ends with the correct option type
+                if not (canonical_symbol.endswith('CE') or canonical_symbol.endswith('PE')):
+                    logging.warning(f"Invalid symbol format in ws_price_update: {canonical_symbol}")
+                    return
+                    
+                # Extract volume traded for stream identification
+                volume_traded = ticks.get('vol_traded_today', 0)
+                
+                # IMPROVEMENT: Always update the data_manager with valid prices for all symbols
+                # Pass volume data to enable stream identification and separation
+                data_manager.update_ltp(canonical_symbol, ltp, volume_traded=volume_traded)
+                
+                # Only update live_prices for the active trade symbol to avoid any confusion
+                if self.active_trade:
+                    traded_symbol = self.active_trade.get('symbol')
+                    
+                    # Only update the live_prices dictionary for the active trade symbol
+                    # This prevents any chance of price mixing in the live_prices dictionary
+                    if canonical_symbol == traded_symbol:
+                        # Extra validation: make sure option types match between symbol and traded symbol
+                        traded_option_type = 'CE' if 'CE' in traded_symbol else ('PE' if 'PE' in traded_symbol else None)
+                        if symbol_option_type == traded_option_type:
+                            # Store the price with the exact canonical symbol to prevent mixup
+                            self.live_prices[canonical_symbol] = ltp
+                            logging.info(f"LTP UPDATE FOR ACTIVE TRADE: {canonical_symbol} {ltp}")
+                        else:
+                            logging.warning(f"OPTION TYPE MISMATCH: ws_symbol={canonical_symbol}({symbol_option_type}), trade_symbol={traded_symbol}({traded_option_type})")
+                    else:
+                        # Different symbol - still log it but don't update live_prices to avoid mixups
+                        logging.info(f"NON-TRADE SYMBOL UPDATE: {canonical_symbol} ({symbol_option_type}), LTP: {ltp}")
+                else:
+                    # No active trade - safe to update all symbols in live_prices
                     self.live_prices[canonical_symbol] = ltp
                     
-                    # For active trades, only update price if the symbol matches EXACTLY
-                    if self.active_trade:
-                        traded_symbol = self.active_trade.get('symbol')
-                        if canonical_symbol == traded_symbol:
-                            logging.info(f"LTP UPDATE FOR ACTIVE TRADE: {canonical_symbol} {ltp}")
-                            # Update data_manager with the latest price to ensure position monitor gets the correct price
-                            data_manager.update_ltp(canonical_symbol, ltp)
-                        else:
-                            # Different symbol but log without affecting the active trade
-                            logging.info(f"NON-TRADE SYMBOL UPDATE: {canonical_symbol}, LTP: {ltp}")
-                    else:
-                        # Handle breakout detection for both CE and PE symbols
-                        if option_type == 'CE' and hasattr(self, 'call_breakout_level') and self.call_breakout_level:
-                            if canonical_symbol == self.get_canonical_symbol(self.highest_call_oi_symbol or ''):
-                                if ltp >= self.call_breakout_level:
-                                    logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (CE) at premium {ltp} >= {self.call_breakout_level}")
-                        elif option_type == 'PE' and hasattr(self, 'put_breakout_level') and self.put_breakout_level:
-                            if canonical_symbol == self.get_canonical_symbol(self.highest_put_oi_symbol or ''):
-                                if ltp >= self.put_breakout_level:
-                                    logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (PE) at premium {ltp} >= {self.put_breakout_level}")
-                        
-                        logging.info(f"No active trade. Updated price for symbol: {canonical_symbol}, LTP: {ltp}")
+                    # Handle breakout detection for both CE and PE symbols
+                    if option_type == 'CE' and hasattr(self, 'call_breakout_level') and self.call_breakout_level:
+                        if canonical_symbol == self.get_canonical_symbol(self.highest_call_oi_symbol or ''):
+                            if ltp >= self.call_breakout_level:
+                                logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (CE) at premium {ltp} >= {self.call_breakout_level}")
+                    elif option_type == 'PE' and hasattr(self, 'put_breakout_level') and self.put_breakout_level:
+                        if canonical_symbol == self.get_canonical_symbol(self.highest_put_oi_symbol or ''):
+                            if ltp >= self.put_breakout_level:
+                                logging.info(f"BREAKOUT DETECTED IN CALLBACK: {canonical_symbol} (PE) at premium {ltp} >= {self.put_breakout_level}")
+                    
+                    logging.info(f"No active trade. Updated price for symbol: {canonical_symbol}, LTP: {ltp}")
         except Exception as e:
             logging.error(f"Error in ws_price_update: {e}")
             logging.error(traceback.format_exc())

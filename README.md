@@ -197,3 +197,14 @@ This project uses API polling only for option data. WebSocket code and hybrid lo
 
 ## Main script
 - test_websocket_fixed.py (now only polls option data)
+
+## Changelog
+
+### September 2025
+- **Fixed Max Up/Down Value Tracking**: Corrected an indentation error in position monitoring that prevented accurate tracking of maximum profit and loss values during trades. See [MAX_UP_DOWN_FIX.md](docs/MAX_UP_DOWN_FIX.md) for details.
+
+### Previous Updates
+- **Improved WebSocket Integration**: Enhanced the reliability and performance of real-time data feeds
+- **Trade Management Enhancements**: Added comprehensive trade logging and history tracking
+- **Strike Price Extraction**: Fixed critical bug affecting option strike price parsing
+- **Symbol Format Standardization**: Improved symbol formatting for compatibility with Fyers API
